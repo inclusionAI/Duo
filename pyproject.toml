@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "duo-world-model"
+version = "0.1.0"
+description = "Offline inference and browser demo for Duo, a reciprocal world model"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [{name = "Duo Contributors"}]
+dependencies = [
+  "numpy==2.4.6",
+]
+
+[project.optional-dependencies]
+realization = [
+  "accelerate==1.14.0",
+  "av==18.1.0",
+  "diffusers==0.41.0",
+  "einops==0.8.2",
+  "peft==0.20.0",
+  "Pillow==12.3.0",
+  "PyYAML==6.0.3",
+  "safetensors==0.8.0",
+  "scipy==1.17.1",
+  "soundfile==0.14.0",
+  "torch==2.11.0",
+  "torchaudio==2.11.0",
+  "torchvision==0.26.0",
+  "transformers==5.16.1",
+]
+intent = [
+  "accelerate==1.14.0",
+  "av==18.1.0",
+  "Pillow==12.3.0",
+  "safetensors==0.8.0",
+  "torch==2.11.0",
+  "torchvision==0.26.0",
+  "transformers==5.16.1",
+]
+speech = [
+  "qwen-asr==0.0.6",
+  "torch==2.11.0",
+]
+dev = ["pytest==8.4.2", "ruff==0.14.3"]
+
+[tool.setuptools.packages.find]
+include = ["duo*"]
+
+[tool.setuptools.package-data]
+"duo.models.codecs._streaming_runtime" = ["LICENSE", "provenance.json", "tables/*.pt"]
+"duo.models.codecs._vae_runtime" = ["native_vae/LICENSE", "native_vae/*.yaml", "sana/*.json"]
+"duo.models.realization" = ["LICENSE.diffusers"]
+"duo.models.realization.modules" = ["native_vae/LICENSE", "native_vae/*.yaml", "sana/*.json"]
+"duo.runtime" = ["LICENSE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+ignore = ["E402"]
+

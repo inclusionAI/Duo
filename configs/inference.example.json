@@ -1,0 +1,37 @@
+{
+  "runtime": {
+    "directory": "runtime"
+  },
+  "cases": {
+    "catalog": "configs/cases/catalog.json",
+    "default": "default"
+  },
+  "executables": {
+    "realization_python": "python",
+    "intent_python": "python",
+    "speech_python": "python",
+    "ffmpeg": "ffmpeg",
+    "ffprobe": "ffprobe"
+  },
+  "weights": {
+    "realization": "weights/realization",
+    "realization_family": "auto",
+    "intent": "weights/intent",
+    "intent_adapter": "weights/intent_adapter",
+    "intent_protocol": "weights/intent_adapter/protocol_manifest.json",
+    "codec": "weights/codec",
+    "speech_recognizer": "weights/speech/recognizer",
+    "forced_aligner": "weights/speech/forced-aligner"
+  },
+  "inference": {
+    "intent_gpu": 0,
+    "realization_gpu": 1,
+    "sampling_steps": 4,
+    "flow_shift": 5.0,
+    "attention": "sdpa",
+    "dtype": "bfloat16",
+    "height": 576,
+    "width": 768,
+    "seed": 42
+  }
+}
