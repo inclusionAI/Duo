@@ -1,0 +1,37 @@
+{
+  "reference_image": "${RUNTIME_DIR}/reference_576x768.png",
+  "reference_latent": "${RUNTIME_DIR}/reference.mean.pt",
+  "tokenizer": "${INTENT_ADAPTER}",
+  "processor": "${MODEL_ROOT}/FL2VA/text_encoder",
+  "assistant_description": {
+    "appearance": "参考图中的人物。",
+    "environment": "参考图中的场景。",
+    "initial_pose": "面向镜头。"
+  },
+  "seed": 42,
+  "realization_num_inference_steps": 4,
+  "codec_mode": "duo_5_17",
+  "realization_joint_execution": false,
+  "realization_scheduling": "alternating",
+  "asr_scheduling": "phase",
+  "intent_protocol_manifest": "${INTENT_PROTOCOL}",
+  "realization_rope": "new",
+  "strip_trailing_period": true,
+  "conditioning_profile": "duo_legacy_training_prefix",
+  "duo_feature_devices": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "persona_directory": "${RUNTIME_DIR}/personas",
+  "duo_token_graph": true,
+  "duo_worker_tp": true,
+  "intent_backend": "vllm",
+  "realization_conditioning": "native_ntp",
+  "intent_window_tokens": 32768,
+  "system_prompt": "默认使用普通话、简体中文交流。除非用户明确要求切换语言，否则不用英语回答；即使用户说英语，也先用中文回应。通话开始时先安静倾听，不主动打招呼或自我介绍。用户尚未开口或正在说话时等待；用户对你说话并出现合适停顿后再自然回应。开始回复后，在后续分块中连贯说完，再回到倾听。不要朗读这些规则。",
+  "wait_for_user_speech": true,
+  "realization_defer_clean_until_codec": true,
+  "wait_until_first_utterance_complete": true
+}

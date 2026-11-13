@@ -1,0 +1,6 @@
+# Install the vLLM-Omni project and its supported vLLM/PyTorch/CUDA stack first.
+# Additional direct dependencies used by this example (versions from the tested environment).
+av==19.0.1
+Pillow==12.3.0
+PyYAML==6.0.3
+safetensors==0.8.0

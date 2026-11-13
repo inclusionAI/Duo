@@ -1,0 +1,73 @@
+{
+  "schema": "duo_intent_protocol_v1",
+  "training_protocol": "strict_causal_chunk_prediction_v1",
+  "chunk_tokens": {
+    "708": {
+      "text": "<chunk_708>",
+      "id": 151679
+    }
+  },
+  "chunk_clock": {
+    "type": "repeating_frame_pattern",
+    "unit": "frames",
+    "fps": 24,
+    "frames": [
+      17
+    ],
+    "protocol_chunk_ms": 708,
+    "boundary_authority": "exact_frame_fraction",
+    "time_base": {
+      "numerator": 1,
+      "denominator": 24,
+      "unit": "second"
+    }
+  },
+  "special_tokens": {
+    "wait": {
+      "text": "<wait>",
+      "id": 151676
+    },
+    "blank": {
+      "text": "<blank>",
+      "id": 151677
+    },
+    "emotions": {},
+    "speak": {
+      "text": "<speak>",
+      "id": 151680
+    }
+  },
+  "trainable_token_ids": [
+    151676,
+    151677,
+    151679,
+    151680
+  ],
+  "tokenizer_json_sha256": "08a5d3b401f178931d3c3a2e937ab8847095e407625d18806f8704f30ed474fe",
+  "chat_template_sha256": "3636d0f0bd6bef02654cdffdc447b79cb2cef8ab02cc75267345946291a489e4",
+  "causal_context": "A_<i text + U_<i text/user_video",
+  "assistant_target_timing": "speech_start_ms",
+  "assistant_video_in_intent_context": false,
+  "h50_layer": 50,
+  "training_options": {
+    "explicit_speak_token": true,
+    "speak_token": {
+      "text": "<speak>",
+      "id": 151680
+    },
+    "action_token_weight": 1.5,
+    "local_history_corruption_probability": 0.05,
+    "missed_opening_recovery_probability": 0.1,
+    "system_prompt_augmentation_probability": 0.25
+  },
+  "adapter_model_sha256": "2f7de1b18f515398f3c56c35b7472c9a15033ddd7f544822c6786bf91853d021",
+  "adapter_config_sha256": "cf3349afc7b1b9d0fcbde52a372561ad2a47504b34cdf9e952963c600fa6f1a2",
+  "fps": 24,
+  "frames_per_block": 17,
+  "source_protocol_sha256": "45565c8d3c745aaa1618635102b078998e6706e5db8361e04f0459c2ec7ec5cc",
+  "tokenizer_transition": {
+    "kind": "verified_declared_speak_addition_v1",
+    "old_sha256": "eea4f2f12458a4197a5d174eac3171cc10c64258aa4cc965ddf0cfeed792c172",
+    "actual_sha256": "08a5d3b401f178931d3c3a2e937ab8847095e407625d18806f8704f30ed474fe"
+  }
+}

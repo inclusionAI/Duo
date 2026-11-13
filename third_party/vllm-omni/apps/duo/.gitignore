@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+!*.json
+!assets/reference.mean.pt
+!web/portraits/*/reference.pt
+recording-spool/
+recordings/
+file-jobs/
+*.mp4
+*.media

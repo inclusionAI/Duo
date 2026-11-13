@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+runtime=$(cd -- "$(dirname -- "$0")" && pwd)
+unset DUO_FA3_LIBRARY DUO_FP8_FA3_LIBRARY
+source "$runtime/environment.sh"
+cd "$DUO_REPO"
+export PATH="$(dirname -- "$DUO_ENGINE_PYTHON"):$PATH"
+export PYTHONPATH="$DUO_ENGINE_PYTHONPATH"
+export LD_LIBRARY_PATH="/usr/local/cuda/compat:${LD_LIBRARY_PATH:-}"
+export PYTHONDONTWRITEBYTECODE=1 PYTHONPYCACHEPREFIX="$DUO_RUNTIME_DIR/pycache"
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
+export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4
+export TRITON_CACHE_DIR="$DUO_RUNTIME_DIR/triton-cache" VLLM_CACHE_ROOT="$DUO_RUNTIME_DIR/vllm-cache"
+export VLLM_OMNI_DUO_SESSION_CONFIG="$DUO_RUNTIME_DIR/session.json"
+export DUO_TRACE_PATH="$DUO_RUNTIME_DIR/trace.jsonl"
+export VLLM_PLUGINS=vllm_omni_register_models VLLM_OMNI_DIFFUSION_RESULT_BUSY_LOOP_S=0.001
+export DUO_SEGMENT_H50=1 DUO_INCREMENTAL_H50=1
+export DUO_NATIVE_FA_VERSION=3 DUO_ATTENTION_POLICY=fa3_unified
+if [[ -n "${DUO_FP8_PROFILES:-}" ]]; then
+  export DUO_FP8_ATTENTION=1 DUO_FP8_PRECONDITION=incremental DUO_FP8_COMPACTION=inplace
+  export DUO_FP8_SCALES="$DUO_FP8_PROFILES"
+  if [[ -n "${DUO_FA3_LIBRARY:-}" ]]; then
+    export DUO_FP8_FA3_LIBRARY="$DUO_FA3_LIBRARY"
+  fi
+else
+  unset DUO_FP8_ATTENTION DUO_FP8_PRECONDITION DUO_FP8_COMPACTION
+  unset DUO_FP8_SCALES
+fi
+export VLLM_ALLREDUCE_USE_SYMM_MEM=0 VLLM_ALLREDUCE_USE_FLASHINFER=0 VLLM_USE_NCCL_SYMM_MEM=0
+unset DUO_SOL_TAU DUO_SOL_COMPUTE DUO_SOL_FP8_KERNEL
+unset DUO_CPU_PROFILE DUO_NCCL_ONLY DUO_ASR_PROBE_DIR DUO_CAPTURE_DIR
+printf '%s\n' "$$" > "$DUO_RUNTIME_DIR/serve.pid"
+rm -f "$DUO_RUNTIME_DIR/warmup.pid"
+exec "$DUO_ENGINE_PYTHON" -m vllm.entrypoints.cli.main serve "$DUO_ASR_MODEL" --omni \
+  --deploy-config "$DUO_RUNTIME_DIR/deploy.yaml" --trust-remote-code --host 127.0.0.1 --port "$DUO_BACKEND_PORT" "$@"

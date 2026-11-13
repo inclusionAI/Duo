@@ -1,0 +1,27 @@
+{
+  "model": "",
+  "modalities": [
+    "audio",
+    "text"
+  ],
+  "input_audio_format": "pcm_f32le",
+  "output_audio_format": "pcm16",
+  "sample_rate_hz": 16000,
+  "audio": {
+    "input": {
+      "sample_rate_hz": 16000
+    },
+    "output": {
+      "sample_rate_hz": 32000
+    }
+  },
+  "turn_detection": null,
+  "temperature": 0.0,
+  "idle_timeout_s": 180,
+  "max_output_tokens": 128,
+  "extra_body": {
+    "auto_response": true,
+    "duo_intent_backend": "vllm",
+    "duo_realization_conditioning": "native_ntp"
+  }
+}
