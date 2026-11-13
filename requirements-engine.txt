@@ -1,0 +1,10 @@
+# Tested image components, not a complete clean-install lockfile.
+# Keep a compatible Torch/CUDA toolchain; install runtime editable with --no-deps.
+torch==2.13.0
+transformers==5.12.1
+sglang==0.5.22
+sglang-kernel==0.4.6.post1
+diffusers==0.37.0
+peft==0.19.1
+av==16.1.0
+tyro==1.0.17

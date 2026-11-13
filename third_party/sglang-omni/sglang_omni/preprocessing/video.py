@@ -1,0 +1,575 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Model-agnostic video preprocessing utilities."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import logging
+import tempfile
+from collections.abc import Mapping
+from itertools import islice
+from pathlib import Path
+
+import av
+import librosa
+import numpy as np
+import numpy.typing as npt
+import torch
+from qwen_vl_utils import vision_process as qwen_vision
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms import functional as tv_f
+
+from sglang_omni.preprocessing.resource_connector import MultiModalResourceConnector
+
+from .base import MediaIO, is_url
+from .cache_key import compute_media_cache_key
+from .resource_connector import await_media_cleanup, global_thread_pool
+
+logger = logging.getLogger(__name__)
+
+
+class VideoDecodeError(RuntimeError):
+    """Raised when video decoding fails."""
+
+
+class VideoMediaIO(MediaIO[tuple[torch.Tensor, float, npt.NDArray[np.float32] | None]]):
+    """MediaIO implementation for video files with optional audio extraction."""
+
+    def __init__(
+        self,
+        *,
+        fps: float | None = None,
+        max_frames: int | None = None,
+        min_pixels: int | None = None,
+        max_pixels: int | None = None,
+        total_pixels: int | None = None,
+        image_mode: str = "RGB",
+        extract_audio: bool = False,
+        audio_target_sr: int = 16000,
+        **kwargs: object,
+    ) -> None:
+        """Initialize VideoMediaIO.
+
+        Args:
+            fps: Target FPS for video loading.
+            max_frames: Optional frame cap passed to the video reader backend.
+            min_pixels: Optional lower resize budget per frame.
+            max_pixels: Optional upper resize budget per frame.
+            total_pixels: Optional total video pixel budget.
+            image_mode: Target image mode (default: "RGB").
+            extract_audio: If True, extract audio from video and return as third element.
+            audio_target_sr: Target sample rate for audio extraction (default: 16000).
+            **kwargs: Additional arguments (for compatibility with MultiModalResourceConnector).
+        """
+        super().__init__()
+        self.fps = fps
+        self.max_frames = max_frames
+        self.min_pixels = min_pixels
+        self.max_pixels = max_pixels
+        self.total_pixels = total_pixels
+        self.image_mode = image_mode
+        self.extract_audio = extract_audio
+        self.audio_target_sr = audio_target_sr
+        self.kwargs = kwargs
+
+    def load_path(self, filepath: Path) -> tuple[torch.Tensor, float]:
+        return load_video_path(
+            filepath,
+            fps=self.fps,
+            max_frames=self.max_frames,
+            min_pixels=self.min_pixels,
+            max_pixels=self.max_pixels,
+            total_pixels=self.total_pixels,
+        )
+
+    def load_bytes(
+        self, data: bytes
+    ) -> tuple[torch.Tensor, float, npt.NDArray[np.float32] | None]:
+        """Load video from raw bytes, optionally extracting audio.
+
+        Returns:
+            Tuple of (video_tensor, sample_fps, audio_or_None).
+            If extract_audio is False, the third element is None.
+        """
+        # qwen_vision._read_video_torchvision requires a file path,
+        # so we need to write to a temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_file:
+            tmp_path = Path(tmp_file.name)
+            tmp_file.write(data)
+
+        try:
+            if self.extract_audio:
+                # Load video and extract audio from the same file
+                video, sample_fps = self.load_path(tmp_path)
+                audio = extract_audio_from_path(tmp_path, self.audio_target_sr)
+                return video, sample_fps, audio
+            else:
+                video, sample_fps = self.load_path(tmp_path)
+                return video, sample_fps, None
+        finally:
+            # Clean up temporary file
+            tmp_path.unlink(missing_ok=True)
+
+    def load_base64(
+        self,
+        media_type: str,
+        data: str,
+    ) -> tuple[torch.Tensor, float, npt.NDArray[np.float32] | None]:
+        """Load video from base64-encoded data, optionally extracting audio."""
+        return self.load_bytes(base64.b64decode(data))
+
+    def load_file(
+        self, filepath: Path
+    ) -> tuple[torch.Tensor, float, npt.NDArray[np.float32] | None]:
+        """Load video from a local file path, optionally extracting audio."""
+        if self.extract_audio:
+            # Load video and extract audio from the same file
+            video, sample_fps = self.load_path(filepath)
+            audio = extract_audio_from_path(filepath, self.audio_target_sr)
+            return video, sample_fps, audio
+        else:
+            video, sample_fps = self.load_path(filepath)
+            return video, sample_fps, None
+
+
+async def ensure_video_list_async(
+    videos: object,
+    *,
+    fps: float | None = None,
+    max_frames: int | None = None,
+    min_pixels: int | None = None,
+    max_pixels: int | None = None,
+    total_pixels: int | None = None,
+    image_mode: str = "RGB",
+    resource_connector: MultiModalResourceConnector | None = None,
+    extract_audio: bool = False,
+    audio_target_sr: int = 16000,
+) -> tuple[
+    list[object], list[float] | None, list[npt.NDArray[np.float32] | None] | None
+]:
+    """Asynchronously normalize video inputs into a list.
+
+    Args:
+        videos: Video input(s) - can be a path, URL, torch Tensor, or list.
+        fps: Target FPS for video loading.
+        max_frames: Optional frame cap passed to the video reader backend.
+        min_pixels: Optional lower resize budget per frame.
+        max_pixels: Optional upper resize budget per frame.
+        total_pixels: Optional total video pixel budget.
+        image_mode: Target image mode (default: "RGB").
+        resource_connector: Optional MultiModalResourceConnector instance. If None, uses
+                        the global connector.
+        extract_audio: If True, extract audio from videos and return as third element.
+        audio_target_sr: Target sample rate for audio extraction (default: 16000).
+
+    Returns:
+        Tuple of (normalized video list, sample_fps_list or None, extracted_audio_list or None).
+        If extract_audio is False, the third element is None.
+    """
+    if videos is None:
+        return [], None, None
+    else:
+        pass
+    if isinstance(videos, list):
+        items = videos
+    else:
+        items = [videos]
+    normalized: list[object] = []
+    sample_fps_list: list[float] = [0.0] * len(items)
+    extracted_audios: list[npt.NDArray[np.float32] | None] = []
+    all_paths = True
+
+    # Import here to avoid circular dependency
+    if resource_connector is None:
+        from .resource_connector import get_global_resource_connector
+
+        resource_connector = get_global_resource_connector()
+    else:
+        pass
+
+    async def _load_video_with_audio(
+        video_item: str | Path, is_url: bool
+    ) -> tuple[torch.Tensor, float, npt.NDArray[np.float32] | None]:
+        """Load video and optionally extract audio."""
+
+        if is_url:
+            # Use fetch_video_async for URL videos, similar to fetch_image_async
+            return await resource_connector.fetch_video_async(
+                str(video_item),
+                fps=fps,
+                max_frames=max_frames,
+                min_pixels=min_pixels,
+                max_pixels=max_pixels,
+                total_pixels=total_pixels,
+                image_mode=image_mode,
+                extract_audio=extract_audio,
+                audio_target_sr=audio_target_sr,
+            )
+        else:
+            media_io = VideoMediaIO(
+                fps=fps,
+                max_frames=max_frames,
+                min_pixels=min_pixels,
+                max_pixels=max_pixels,
+                total_pixels=total_pixels,
+                extract_audio=extract_audio,
+                audio_target_sr=audio_target_sr,
+            )
+            video_path = Path(video_item)
+            loop = asyncio.get_running_loop()
+            if not extract_audio:
+                video_future = loop.run_in_executor(
+                    global_thread_pool, media_io.load_file, video_path
+                )
+
+                async def cleanup_video_decoder() -> None:
+                    await asyncio.gather(video_future, return_exceptions=True)
+
+                try:
+                    return await asyncio.shield(video_future)
+                finally:
+                    await await_media_cleanup(cleanup_video_decoder())
+            else:
+                frames_future = loop.run_in_executor(
+                    global_thread_pool, media_io.load_path, video_path
+                )
+                audio_future = loop.run_in_executor(
+                    global_thread_pool,
+                    extract_audio_from_path,
+                    video_path,
+                    audio_target_sr,
+                )
+
+                async def cleanup_video_audio_decoders() -> None:
+                    await asyncio.gather(
+                        frames_future, audio_future, return_exceptions=True
+                    )
+
+                try:
+                    (frames, sample_fps), audio = await asyncio.gather(
+                        asyncio.shield(frames_future), asyncio.shield(audio_future)
+                    )
+                    return frames, sample_fps, audio
+                finally:
+                    await await_media_cleanup(cleanup_video_audio_decoders())
+
+    # Collect coroutines for URL and local file items
+    coroutines: list[
+        asyncio.Task[tuple[torch.Tensor, float, npt.NDArray[np.float32] | None]]
+    ] = []
+    url_indices: list[int] = []
+
+    try:
+        # note (Teery): First pass: identify items that need loading
+        for idx, video_item in enumerate(items):
+            if isinstance(video_item, (str, Path)):
+                if is_url(video_item):
+                    # note (Teery): Create coroutine for async URL fetching with optional audio extraction
+                    coro = _load_video_with_audio(video_item, is_url=True)
+                    task = asyncio.create_task(coro)
+                    coroutines.append(task)
+                    url_indices.append(idx)
+                    normalized.append(None)  # note (Teery): Placeholder for video
+                    if extract_audio:
+                        extracted_audios.append(
+                            None
+                        )  # note (Teery): Placeholder for audio
+                    else:
+                        pass
+                elif Path(resource_connector.local_media_path(video_item)).exists():
+                    # note (Teery): Load from local path with optional audio extraction
+                    coro = _load_video_with_audio(video_item, is_url=False)
+                    task = asyncio.create_task(coro)
+                    coroutines.append(task)
+                    url_indices.append(idx)
+                    normalized.append(None)  # note (Teery): Placeholder for video
+                    if extract_audio:
+                        extracted_audios.append(
+                            None
+                        )  # note (Teery): Placeholder for audio
+                    else:
+                        pass
+                else:
+                    # note (Teery): Path doesn't exist, treat as already processed
+                    normalized.append(video_item)
+                    all_paths = False
+                    if extract_audio:
+                        extracted_audios.append(None)
+                    else:
+                        pass
+            else:
+                # note (Teery): Already processed (torch Tensor, etc.)
+                normalized.append(video_item)
+                all_paths = False
+                if extract_audio:
+                    extracted_audios.append(None)
+                else:
+                    pass
+
+        # note (Teery): Wait for all loads to complete
+        if coroutines:
+            results = await asyncio.gather(*coroutines)
+            # note (Teery): Fill in the results at the correct indices
+            for url_idx, (video, sample_fps, audio) in zip(url_indices, results):
+                normalized[url_idx] = video
+                sample_fps_list[url_idx] = sample_fps
+                if extract_audio:
+                    extracted_audios[url_idx] = audio
+                else:
+                    pass
+        else:
+            pass
+    finally:
+        for task in coroutines:
+            if not task.done():
+                task.cancel()
+            else:
+                pass
+
+        async def cleanup_loaders() -> None:
+            await asyncio.gather(*coroutines, return_exceptions=True)
+
+        await await_media_cleanup(cleanup_loaders())
+
+    if all_paths:
+        return (
+            normalized,
+            sample_fps_list,
+            extracted_audios if extract_audio else None,
+        )
+    else:
+        pass
+    return normalized, None, extracted_audios if extract_audio else None
+
+
+def extract_audio_from_path(
+    video_path: Path, target_sr: int
+) -> npt.NDArray[np.float32] | None:
+    """Decode the first audio stream to mono float32 at the target sample rate."""
+    try:
+        with av.open(str(video_path)) as container:
+            audio_stream = next(
+                (stream for stream in container.streams if stream.type == "audio"),
+                None,
+            )
+            if audio_stream is None:
+                return None
+            else:
+                pass
+
+            sample_rate = audio_stream.rate
+            resampler = av.AudioResampler(
+                format="fltp",
+                layout=audio_stream.layout.name,
+                rate=sample_rate,
+            )
+            chunks: list[npt.NDArray[np.float32]] = []
+            for frame in container.decode(audio_stream):
+                for resampled in resampler.resample(frame):
+                    chunks.append(resampled.to_ndarray())
+            for resampled in resampler.resample(None):
+                chunks.append(resampled.to_ndarray())
+
+        if not chunks:
+            raise VideoDecodeError(
+                f"Embedded audio stream decoded no samples: {video_path}"
+            )
+        else:
+            pass
+        audio = librosa.to_mono(np.concatenate(chunks, axis=1))
+        return librosa.resample(audio, orig_sr=sample_rate, target_sr=target_sr)
+    except VideoDecodeError:
+        raise
+    except (av.error.InvalidDataError, av.error.EOFError) as exc:
+        raise VideoDecodeError(
+            f"Invalid media data while extracting embedded audio from {video_path}: {exc}"
+        ) from exc
+    except Exception as exc:
+        raise VideoDecodeError(
+            f"Failed to extract embedded audio from {video_path}: {exc}"
+        ) from exc
+
+
+def is_invalid_video(path: Path, error: Exception) -> bool:
+    if isinstance(error, (av.error.InvalidDataError, av.error.EOFError)):
+        return True
+    else:
+        pass
+    if isinstance(error, (OSError, MemoryError, ImportError, torch.OutOfMemoryError)):
+        return False
+    else:
+        pass
+    # note (Teery): Some readers hide PyAV errors behind missing frame metadata.
+    try:
+        with av.open(str(path)) as container:
+            stream = next(
+                (
+                    video_stream
+                    for video_stream in container.streams
+                    if video_stream.type == "video"
+                ),
+                None,
+            )
+            if stream is None:
+                return True
+            else:
+                pass
+            packet_count = 0
+            for packet_count, packet in enumerate(
+                islice(container.demux(stream), 32), 1
+            ):
+                if packet.decode():
+                    return False
+                else:
+                    pass
+            # note (Teery): An inconclusive probe must preserve the backend failure.
+            return packet_count < 32
+    except (av.error.InvalidDataError, av.error.EOFError):
+        return True
+    except Exception:
+        return False
+
+
+def load_video_path(
+    path: str | Path,
+    fps: float | None = None,
+    max_frames: int | None = None,
+    min_pixels: int | None = None,
+    max_pixels: int | None = None,
+    total_pixels: int | None = None,
+) -> tuple[torch.Tensor, float]:
+    """Load a local video into a torch tensor (T, C, H, W) on CPU."""
+    path = Path(path)
+    ele: dict[str, str | float | int] = {"video": str(path)}
+    if fps is not None:
+        ele["fps"] = float(fps)
+    else:
+        pass
+    if max_frames is not None:
+        ele["max_frames"] = int(max_frames)
+    else:
+        pass
+    if min_pixels is not None:
+        ele["min_pixels"] = int(min_pixels)
+    else:
+        pass
+    if max_pixels is not None:
+        ele["max_pixels"] = int(max_pixels)
+    else:
+        pass
+    if total_pixels is not None:
+        ele["total_pixels"] = int(total_pixels)
+    else:
+        pass
+    backend = qwen_vision.get_video_reader_backend()
+    try:
+        video, sample_fps = qwen_vision.VIDEO_READER_BACKENDS[backend](ele)
+    except Exception as backend_exc:
+        if backend == "torchvision":
+            if is_invalid_video(path, backend_exc):
+                raise VideoDecodeError(
+                    f"Invalid media data while decoding video path={path}: {backend_exc}"
+                ) from backend_exc
+            else:
+                pass
+            raise VideoDecodeError(
+                f"Failed to decode video path={path}; torchvision failed with "
+                f"{type(backend_exc).__name__}: {backend_exc}"
+            ) from backend_exc
+        else:
+            pass
+        logger.warning(f"Video reader {backend} failed, falling back to torchvision")
+        try:
+            video, sample_fps = qwen_vision.VIDEO_READER_BACKENDS["torchvision"](ele)
+        except Exception as fallback_exc:
+            if is_invalid_video(path, fallback_exc):
+                raise VideoDecodeError(
+                    f"Invalid media data while decoding video path={path}: {fallback_exc}"
+                ) from fallback_exc
+            else:
+                pass
+            raise VideoDecodeError(
+                f"Failed to decode video path={path}; {backend} failed with "
+                f"{type(backend_exc).__name__}: {backend_exc}; "
+                f"torchvision failed with {type(fallback_exc).__name__}: "
+                f"{fallback_exc}"
+            ) from fallback_exc
+    nframes, _, height, width = video.shape
+    if not nframes:
+        raise VideoDecodeError(
+            f"Invalid media data while decoding video path={path}: no frames"
+        )
+    else:
+        pass
+    min_pixels = ele.get("min_pixels", qwen_vision.VIDEO_MIN_PIXELS)
+    total_pixels = ele.get("total_pixels", qwen_vision.VIDEO_TOTAL_PIXELS)
+    max_pixels = max(
+        min(
+            qwen_vision.VIDEO_MAX_PIXELS,
+            total_pixels / nframes * qwen_vision.FRAME_FACTOR,
+        ),
+        int(min_pixels * 1.05),
+    )
+    max_pixels_supposed = ele.get("max_pixels", max_pixels)
+    max_pixels = min(max_pixels_supposed, max_pixels)
+    if "resized_height" in ele and "resized_width" in ele:
+        resized_height, resized_width = qwen_vision.smart_resize(
+            ele["resized_height"],
+            ele["resized_width"],
+            factor=qwen_vision.IMAGE_FACTOR,
+        )
+    else:
+        resized_height, resized_width = qwen_vision.smart_resize(
+            height,
+            width,
+            factor=qwen_vision.IMAGE_FACTOR,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+        )
+    video = tv_f.resize(
+        video,
+        [resized_height, resized_width],
+        interpolation=InterpolationMode.BICUBIC,
+        antialias=True,
+    ).float()
+    return video, sample_fps
+
+
+def build_video_mm_inputs(
+    hf_inputs: Mapping[str, torch.Tensor],
+) -> dict[str, torch.Tensor | bool | None]:
+    return {
+        "pixel_values_videos": hf_inputs.get("pixel_values_videos"),
+        "video_grid_thw": hf_inputs.get("video_grid_thw"),
+        "video_second_per_grid": hf_inputs.get("video_second_per_grid"),
+    }
+
+
+def compute_video_cache_key(
+    videos: object,
+    *,
+    fps: float | None = None,
+    max_frames: int | None = None,
+    min_pixels: int | None = None,
+    max_pixels: int | None = None,
+    total_pixels: int | None = None,
+) -> str | None:
+    """Compute cache key from loaded video frames + effective decode params.
+
+    Decode params change the resulting frame count and thus the encoder
+    output length. They must be part of the cache key — otherwise an entry
+    produced under one (fps, max_frames, pixel-limit) tuple could be
+    returned for a request with different params, yielding video_embeds
+    whose length no longer matches the prompt placeholders.
+    """
+    base = compute_media_cache_key(videos, prefix="video")
+    if base is None:
+        return None
+    else:
+        pass
+    decode_sig = (
+        f"|fps={fps}|max_frames={max_frames}"
+        f"|min_px={min_pixels}|max_px={max_pixels}|total_px={total_pixels}"
+    )
+    return base + decode_sig

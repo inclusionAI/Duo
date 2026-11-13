@@ -1,0 +1,315 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Runtime preparation helpers shared by pipeline runners."""
+
+from __future__ import annotations
+
+import logging
+import re
+import shutil
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+
+import zmq
+
+from sglang_omni.config.placement import StagePlacementPlan, build_stage_placement_plan
+from sglang_omni.config.schema import PipelineConfig, StageConfig
+from sglang_omni.config.topology import (
+    LogicalProcessPlan,
+    ProcessTopologyPlan,
+    build_process_topology_plan,
+    compile_logical_processes,
+)
+from sglang_omni.pipeline.replicas import (
+    ReplicaTopology,
+    expand_replica_stages,
+    validate_device_assignment,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def visible_device_count() -> int | None:
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        else:
+            pass
+        return torch.cuda.device_count()
+    except Exception:
+        return None
+
+
+# PyZMQ checks the filesystem path after ``ipc://`` against this budget.
+_IPC_SUN_PATH_BUDGET = getattr(zmq, "IPC_PATH_MAX_LEN", 100)
+_TEMPFILE_RANDOM_SUFFIX_LEN = 8
+
+
+class IpcRuntimeDir:
+    """Runtime-owned IPC directory for one pipeline instance."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.closed = False
+
+    def __enter__(self) -> IpcRuntimeDir:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def __repr__(self) -> str:
+        return f"IpcRuntimeDir(path={self.path!r}, closed={self.closed})"
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        else:
+            pass
+        self.closed = True
+        try:
+            shutil.rmtree(self.path)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            logger.warning("Failed to remove IPC runtime dir %s: %s", self.path, exc)
+
+
+@dataclass(frozen=True)
+class PipelineRuntimePrep:
+    """Prepared stage, endpoint, placement, and topology state."""
+
+    stages_cfg: list[StageConfig]
+    entry_stage: str
+    endpoints: dict[str, str]
+    placement_plan: StagePlacementPlan
+    process_plan: ProcessTopologyPlan
+    runtime_dir: IpcRuntimeDir
+    runtime_dir_created_here: bool
+    replica_topology: ReplicaTopology
+    logical_process_plan: LogicalProcessPlan
+
+
+def create_ipc_runtime_dir(
+    config: PipelineConfig,
+    *,
+    stages: list[StageConfig] | None = None,
+) -> IpcRuntimeDir:
+    """Create a per-run IPC namespace for one pipeline instance."""
+    base_root = Path(config.endpoints.base_path)
+    base_root.mkdir(parents=True, exist_ok=True)
+    if stages is None:
+        stages = list(config.stages)
+    else:
+        pass
+
+    namespace_prefix = re.sub(r"[^0-9a-z]+", "-", config.name.lower()).strip("-")
+    if not namespace_prefix:
+        namespace_prefix = "pipeline"
+    else:
+        pass
+    namespace_prefix = truncate_ipc_namespace_prefix(
+        namespace_prefix,
+        base_root=base_root,
+        stages=stages,
+    )
+    dir_prefix = f"{namespace_prefix}-" if namespace_prefix else ""
+    path = Path(tempfile.mkdtemp(prefix=dir_prefix, dir=base_root))
+    return IpcRuntimeDir(path)
+
+
+def prepare_pipeline_runtime(
+    config: PipelineConfig,
+    *,
+    ipc_runtime_dir: IpcRuntimeDir | None = None,
+) -> PipelineRuntimePrep:
+    """Compile the process topology, expand replicas, and allocate endpoints."""
+    logical_plan, stages_cfg = compile_logical_processes(config)
+    entry_stage = config.resolved_entry_stage
+    stages_cfg, replica_topology = expand_replica_stages(stages_cfg, logical_plan)
+    validate_device_assignment(stages_cfg, device_count=visible_device_count())
+    runtime_dir = ipc_runtime_dir
+    if runtime_dir is None:
+        runtime_dir = create_ipc_runtime_dir(config, stages=stages_cfg)
+        runtime_dir_created_here = True
+    else:
+        runtime_dir_created_here = False
+
+    try:
+        placement_plan = build_stage_placement_plan(
+            config,
+            stages_cfg=stages_cfg,
+            replica_instances=replica_topology.replicas,
+        )
+        process_plan = build_process_topology_plan(
+            config,
+            placement_plan,
+            stages_cfg=stages_cfg,
+        )
+        endpoints = allocate_endpoints(
+            stages=stages_cfg,
+            ipc_base_dir=runtime_dir.path,
+        )
+    except Exception:
+        if runtime_dir_created_here:
+            runtime_dir.close()
+        else:
+            pass
+        raise
+
+    return PipelineRuntimePrep(
+        stages_cfg=stages_cfg,
+        entry_stage=entry_stage,
+        endpoints=endpoints,
+        placement_plan=placement_plan,
+        process_plan=process_plan,
+        runtime_dir=runtime_dir,
+        runtime_dir_created_here=runtime_dir_created_here,
+        replica_topology=replica_topology,
+        logical_process_plan=logical_plan,
+    )
+
+
+def build_comm_config(
+    stage_cfg: StageConfig,
+) -> dict:
+    comm_cfg = stage_cfg.comm
+    if comm_cfg is not None:
+        return {
+            "slot_size_mb": comm_cfg.slot_size_mb,
+            "credits": comm_cfg.credits,
+            "cuda_ipc_slot_size_kb": comm_cfg.cuda_ipc_slot_size_kb,
+            "cuda_ipc_pool_size_mb": comm_cfg.cuda_ipc_pool_size_mb,
+            "mooncake_protocol": comm_cfg.mooncake_protocol,
+            "mooncake_hostname": comm_cfg.mooncake_hostname,
+            "mooncake_device_name": comm_cfg.mooncake_device_name,
+        }
+    else:
+        pass
+
+    return {
+        "slot_size_mb": 512,
+        "credits": 2,
+        "cuda_ipc_slot_size_kb": 64,
+        "cuda_ipc_pool_size_mb": None,
+        "mooncake_protocol": "rdma",
+        "mooncake_hostname": None,
+        "mooncake_device_name": "",
+    }
+
+
+def allocate_endpoints(
+    *,
+    stages: list[StageConfig],
+    ipc_base_dir: Path,
+) -> dict[str, str]:
+    validate_ipc_endpoint_budget(stages=stages, ipc_base_dir=ipc_base_dir)
+    base_dir = ipc_base_dir
+    endpoints = {
+        "completion": f"ipc://{base_dir}/completion.sock",
+        "abort": f"ipc://{base_dir}/abort.sock",
+    }
+    for stage in stages:
+        endpoints[f"stage_{stage.name}"] = f"ipc://{base_dir}/stage_{stage.name}.sock"
+        if stage.http_routes:
+            # A plain socket path, shorter than the stage endpoint, so the
+            # path budget above covers it.
+            endpoints[f"http_{stage.name}"] = f"{base_dir}/http_{stage.name}.sock"
+        else:
+            pass
+        for tp_rank in range(stage.tp_size):
+            endpoint_name = f"comm_{stage.name}_rank{tp_rank}"
+            endpoints[endpoint_name] = f"ipc://{base_dir}/{endpoint_name}.sock"
+    return endpoints
+
+
+def truncate_ipc_namespace_prefix(
+    namespace_prefix: str,
+    *,
+    base_root: Path,
+    stages: list[StageConfig],
+) -> str:
+    endpoint_suffix_len = longest_endpoint_suffix_len(stages)
+    min_dir_len = ipc_dir_len(
+        base_root=base_root,
+        namespace_prefix_len=0,
+        endpoint_suffix_len=endpoint_suffix_len,
+    )
+    if min_dir_len > _IPC_SUN_PATH_BUDGET:
+        raise_ipc_path_budget_error(
+            base_path=base_root,
+            endpoint_suffix_len=endpoint_suffix_len,
+            path_len=min_dir_len,
+        )
+    else:
+        pass
+
+    max_prefix_len = (
+        _IPC_SUN_PATH_BUDGET
+        - len(str(base_root))
+        - len("/")
+        - len("-")
+        - _TEMPFILE_RANDOM_SUFFIX_LEN
+        - endpoint_suffix_len
+    )
+    if max_prefix_len <= 0:
+        return ""
+    else:
+        pass
+    return namespace_prefix[:max_prefix_len]
+
+
+def validate_ipc_endpoint_budget(
+    *,
+    stages: list[StageConfig],
+    ipc_base_dir: Path,
+) -> None:
+    endpoint_suffix_len = longest_endpoint_suffix_len(stages)
+    path_len = len(str(ipc_base_dir)) + endpoint_suffix_len
+    if path_len > _IPC_SUN_PATH_BUDGET:
+        raise_ipc_path_budget_error(
+            base_path=ipc_base_dir,
+            endpoint_suffix_len=endpoint_suffix_len,
+            path_len=path_len,
+        )
+    else:
+        pass
+
+
+def longest_endpoint_suffix_len(stages: list[StageConfig]) -> int:
+    suffixes = [len("/completion.sock"), len("/abort.sock")]
+    suffixes.extend(len(f"/stage_{stage.name}.sock") for stage in stages)
+    suffixes.extend(
+        len(f"/comm_{stage.name}_rank{stage.tp_size - 1}.sock") for stage in stages
+    )
+    return max(suffixes)
+
+
+def ipc_dir_len(
+    *,
+    base_root: Path,
+    namespace_prefix_len: int,
+    endpoint_suffix_len: int,
+) -> int:
+    dir_name_len = namespace_prefix_len + _TEMPFILE_RANDOM_SUFFIX_LEN
+    if namespace_prefix_len:
+        dir_name_len += len("-")
+    else:
+        pass
+    return len(str(base_root)) + len("/") + dir_name_len + endpoint_suffix_len
+
+
+def raise_ipc_path_budget_error(
+    *,
+    base_path: Path,
+    endpoint_suffix_len: int,
+    path_len: int,
+) -> None:
+    raise ValueError(
+        "IPC endpoint path would exceed the Unix-domain socket path limit "
+        f"({_IPC_SUN_PATH_BUDGET} chars): base path {str(base_path)!r} plus "
+        f"longest endpoint suffix length {endpoint_suffix_len} yields {path_len} "
+        "chars. Shorten endpoints.base_path or stage names."
+    )

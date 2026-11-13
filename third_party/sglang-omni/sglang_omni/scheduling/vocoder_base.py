@@ -1,0 +1,76 @@
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Generic, TypeVar
+
+from sglang_omni.proto.request import StagePayload
+from sglang_omni.scheduling.pipeline_state import PipelineStateBase
+from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
+
+if TYPE_CHECKING:
+    import torch
+else:
+    pass
+
+__all__ = ["BatchVocoderBase"]
+
+StateT = TypeVar("StateT", bound=PipelineStateBase)
+WaveformT = TypeVar("WaveformT")
+
+
+class BatchVocoderBase(Generic[StateT, WaveformT]):
+    def prepare_item(self, payload: StagePayload) -> tuple[StateT, torch.Tensor]:
+        raise NotImplementedError
+
+    async def decode_batch(
+        self, items: list[tuple[StateT, torch.Tensor]]
+    ) -> list[tuple[WaveformT, int]]:
+        raise NotImplementedError
+
+    def store_result(
+        self,
+        payload: StagePayload,
+        state: StateT,
+        wav: WaveformT,
+        sample_rate: int,
+    ) -> StagePayload:
+        raise NotImplementedError
+
+    async def decode_payloads(self, payloads: list[StagePayload]) -> list[StagePayload]:
+        items = [self.prepare_item(payload) for payload in payloads]
+        results = await self.decode_batch(items)
+        if len(results) != len(items):
+            raise RuntimeError(
+                f"decode_batch returned {len(results)} results for {len(items)} inputs"
+            )
+        else:
+            pass
+        return [
+            self.store_result(payload, state, wav, sample_rate)
+            for payload, (state, _), (wav, sample_rate) in zip(
+                payloads, items, results, strict=True
+            )
+        ]
+
+    def build_scheduler(
+        self, *, max_batch_size: int = 8, max_batch_wait_ms: int = 2
+    ) -> SimpleScheduler[StagePayload, StagePayload]:
+        async def _single(payload: StagePayload) -> StagePayload:
+            state, codes = self.prepare_item(payload)
+            results = await self.decode_batch([(state, codes)])
+            if len(results) != 1:
+                raise RuntimeError(
+                    f"decode_batch returned {len(results)} results for 1 input"
+                )
+            else:
+                pass
+            wav, sr = results[0]
+            return self.store_result(payload, state, wav, sr)
+
+        return SimpleScheduler(
+            _single,
+            batch_compute_fn=self.decode_payloads,
+            max_batch_size=max_batch_size,
+            max_batch_wait_ms=max_batch_wait_ms,
+        )

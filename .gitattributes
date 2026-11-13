@@ -1,3 +1,0 @@
-assets/*.pdf binary
-assets/Duo_Technical_Report.pdf filter=lfs diff=lfs merge=lfs -text
-demo/showcase/*.mp4 binary

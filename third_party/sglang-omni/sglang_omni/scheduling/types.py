@@ -1,0 +1,171 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Scheduling types used by OmniScheduler and SGLang components."""
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import TYPE_CHECKING, Generic, Protocol, SupportsIndex, SupportsInt
+
+from typing_extensions import TypeVar
+
+from sglang_omni.scheduling.message import OutgoingMessage
+
+if TYPE_CHECKING:
+    import torch
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
+else:
+    pass
+
+
+class SchedulerStatus(Enum):
+    WAITING = auto()
+    RUNNING = auto()
+    FINISHED = auto()
+    ABORTED = auto()
+
+
+@dataclass
+class SchedulerRequest:
+    request_id: str
+    status: SchedulerStatus = SchedulerStatus.WAITING
+    data: ARRequestData | None = None
+    error: Exception | None = None
+    arrival_time: float = 0.0
+    finish_time: float | None = None
+
+
+ValueT = TypeVar("ValueT", default=object)
+
+
+class CompletionFuture(Protocol):
+    def done(self) -> bool: ...
+
+    def result(self, timeout: float | None = None) -> object: ...
+
+
+@dataclass(slots=True)
+class DeferredAdmission(Generic[ValueT]):
+    value: ValueT
+    ready: CompletionFuture
+
+
+@dataclass
+class SchedulerOutput:
+    requests: list[SchedulerRequest]
+    batch_data: ScheduleBatch | None
+    step_id: int = 0
+
+    @property
+    def request_ids(self) -> list[str]:
+        return [r.request_id for r in self.requests]
+
+
+@dataclass
+class RequestOutput:
+    request_id: str
+    data: str | bytes | bytearray | SupportsInt | SupportsIndex | None = None
+    finished: bool = False
+    extra: dict[str, torch.Tensor] | None = None
+
+
+@dataclass
+class ModelRunnerOutput:
+    outputs: dict[str, RequestOutput]
+    req_ids: list[str] = field(default_factory=list)
+    req_id_to_index: dict[str, int] = field(default_factory=dict)
+    can_run_cuda_graph: bool = False
+    # Reporting tokens for this completed step. These are deliberately separate
+    # from the GPU FutureMap relay used as the next forward's input.
+    next_token_ids: "torch.Tensor | None" = None
+    # Optional pinned-host copy used for CPU-side result processing without a
+    # pageable device-to-host synchronization.
+    host_token_ids: "torch.Tensor | None" = None
+
+
+@dataclass
+class ARRequestData:
+    """Backend-neutral autoregressive request state."""
+
+    input_ids: "torch.Tensor | None" = None
+    attention_mask: "torch.Tensor | None" = None
+    model_inputs: dict[str, object] = field(default_factory=dict)
+    output_ids: list[int] = field(default_factory=list)
+    extra_model_outputs: dict[str, torch.Tensor | list[torch.Tensor] | list[int]] = (
+        field(default_factory=dict)
+    )
+    finish_reason: str | None = None
+    weight_version: str | None = None
+    return_logprob: bool = False
+    output_token_logprobs: list[list[float | int]] = field(default_factory=list)
+    capture_model_output_keys: tuple[str, ...] = ()
+    max_new_tokens: int | None = None
+    enforce_request_limits: bool = False
+    temperature: float = 0.0
+    # note(ratish): the scheduler clears both on every request it finishes and
+    # compacts the history of every request it retracts, whatever the model.
+    prefill_input_embeds: "torch.Tensor | None" = None
+    decode_input_embeds: list["torch.Tensor"] | None = field(default_factory=list)
+
+
+RequestDataT = TypeVar("RequestDataT", bound=ARRequestData, default=ARRequestData)
+RequestDataInput = TypeVar(
+    "RequestDataInput",
+    bound=ARRequestData,
+    default=ARRequestData,
+    contravariant=True,
+)
+
+
+class StreamOutputBuilder(Protocol[RequestDataInput]):
+    def __call__(
+        self,
+        request_id: str,
+        request_data: RequestDataInput,
+        request_output: RequestOutput,
+        /,
+    ) -> Iterable[OutgoingMessage]: ...
+
+
+def sampled_logprobs_to_list(
+    next_token_logprobs: torch.Tensor | None,
+) -> list[float] | None:
+    """Convert sampler-produced per-row selected-token logprobs to a list.
+
+    The sampler owns logprob semantics such as temperature and original-logprob
+    mode. Rollout code should preserve those selected-token values instead of
+    recomputing logprobs from logits.
+    """
+
+    if next_token_logprobs is None:
+        return None
+    else:
+        pass
+    if hasattr(next_token_logprobs, "detach"):
+        values = next_token_logprobs.detach().float().cpu().tolist()
+    elif hasattr(next_token_logprobs, "tolist"):
+        values = next_token_logprobs.tolist()
+    else:
+        values = next_token_logprobs
+    if isinstance(values, (int, float)):
+        return [float(values)]
+    else:
+        pass
+    if not isinstance(values, (list, tuple)):
+        return None
+    else:
+        pass
+
+    out: list[float] = []
+    for value in values:
+        if isinstance(value, (list, tuple)):
+            if len(value) != 1:
+                return None
+            else:
+                pass
+            value = value[0]
+        else:
+            pass
+        out.append(float(value))
+    return out

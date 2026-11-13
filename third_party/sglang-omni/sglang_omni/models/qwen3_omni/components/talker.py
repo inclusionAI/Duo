@@ -1,0 +1,2018 @@
+"""
+SGLang-native Talker model for Qwen3-Omni compatiable with hf formatting.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Iterable, Optional, Tuple
+
+import torch
+from sglang.kernels.fused_op import get_fused_op_backend
+from sglang.kernels.spec import KernelBackend
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
+from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.runtime_context import get_context, get_schedule
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import add_prefix
+from torch import nn
+
+from sglang_omni.models.qwen3_omni.components.thinker_model import (
+    Qwen3OmniMoeThinkerTextAttention,
+    Qwen3OmniMoeThinkerTextDecoderLayer,
+    Qwen3OmniMoeThinkerTextSparseMoeBlock,
+)
+from sglang_omni.models.qwen3_omni.hf_config import (
+    Qwen3OmniMoeTalkerConfig,
+    Qwen3OmniMoeTalkerTextConfig,
+)
+from sglang_omni.platforms import current_platform
+from sglang_omni.quantization import get_weight_preprocessor
+from sglang_omni.sampling.sampler_compile import (
+    SamplerCompileForms,
+    compile_sampler_functions,
+)
+from sglang_omni.sampling.seed import (
+    SAMPLING_SEED_MASK,
+    derive_sampling_seed,
+    resolve_row_seed,
+)
+from sglang_omni.utils.predictor_layers import (
+    add_rmsnorm_rounded,
+    codebook_step,
+    resolve_fused_predictor_layers,
+    supports_exact_add_rmsnorm,
+)
+from sglang_omni.vendor.sglang.core import ForwardBatch
+from sglang_omni.vendor.sglang.layers import (
+    AuxHiddenStateList,
+    MergedColumnParallelLinear,
+    MRotaryEmbedding,
+    QuantizationConfig,
+    ReplicatedLinear,
+    RMSNorm,
+    RowParallelLinear,
+    SiluAndMul,
+    residual_batch,
+)
+from sglang_omni.vendor.sglang.models import FusedSetKVBufferArg, apply_qk_norm
+from sglang_omni.vendor.sglang.utils import make_layers
+
+logger = logging.getLogger(__name__)
+
+
+def bind_default_weight_loaders(module: nn.Module) -> None:
+    for param in module.parameters():
+        if not hasattr(param, "weight_loader"):
+            param.weight_loader = default_weight_loader
+        else:
+            pass
+
+
+class PredictorDecodeGraph:
+    """CUDA graph for one Qwen3-Omni predictor single-token decode bucket."""
+
+    def __init__(
+        self,
+        model: "Qwen3OmniTalker",
+        batch_size: int,
+        code_dtype: torch.dtype,
+    ) -> None:
+        self.model = model
+        self.batch_size = batch_size
+        self.code_dtype = code_dtype
+        device = model.predictor_input_buffer.device
+        hidden_size = model.predictor_input_buffer.shape[-1]
+        dtype = model.predictor_input_buffer.dtype
+
+        self.layer0_codes = torch.zeros(
+            batch_size,
+            1,
+            dtype=code_dtype,
+            device=device,
+        )
+        self.talker_hidden = torch.zeros(
+            batch_size,
+            1,
+            hidden_size,
+            dtype=dtype,
+            device=device,
+        )
+        self.graph = torch.cuda.CUDAGraph()
+        self.result_codes: torch.Tensor | None = None
+        self.summed_embeddings: torch.Tensor | None = None
+        self.capture()
+
+    # Note (zijiecode): capture in the same mode as replay. SGLang registers the
+    # CUDA generator from inference mode, so on torch 2.9 (ROCm) a no_grad
+    # capture_begin() is refused as an inplace update to an inference tensor
+    # and the aborted capture breaks every later graph in the process.
+    @torch.inference_mode()
+    def capture(self) -> None:
+        device = self.layer0_codes.device
+        with torch.cuda.device(device):
+            warmup_stream = torch.cuda.Stream(device=device)
+            current_stream = torch.cuda.current_stream(device=device)
+            warmup_stream.wait_stream(current_stream)
+            with torch.cuda.stream(warmup_stream):
+                for _ in range(2):
+                    self.model.code_predictor_forward_incremental_eager(
+                        self.layer0_codes,
+                        self.talker_hidden,
+                    )
+            current_stream.wait_stream(warmup_stream)
+
+            capture_stream = torch.cuda.Stream(device=device)
+            capture_stream.wait_stream(current_stream)
+            with torch.cuda.graph(
+                self.graph,
+                stream=capture_stream,
+                capture_error_mode="thread_local",
+            ):
+                self.result_codes, self.summed_embeddings = (
+                    self.model.code_predictor_forward_incremental_eager(
+                        self.layer0_codes,
+                        self.talker_hidden,
+                    )
+                )
+            current_stream.wait_stream(capture_stream)
+
+        if self.result_codes is None or self.summed_embeddings is None:
+            raise RuntimeError("Qwen3-Omni predictor CUDA graph captured no outputs")
+        else:
+            pass
+
+    @torch.inference_mode()
+    def replay(
+        self,
+        layer0_codes: torch.Tensor,
+        talker_hidden: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        live_batch_size = layer0_codes.shape[0]
+        if live_batch_size > self.batch_size:
+            raise ValueError(
+                "Qwen3-Omni predictor CUDA graph bucket is too small: "
+                f"bucket={self.batch_size}, live={live_batch_size}"
+            )
+        else:
+            pass
+
+        with torch.cuda.device(self.layer0_codes.device):
+            self.layer0_codes[:live_batch_size].copy_(layer0_codes)
+            self.talker_hidden[:live_batch_size].copy_(talker_hidden)
+            if live_batch_size < self.batch_size:
+                self.layer0_codes[live_batch_size:].zero_()
+                self.talker_hidden[live_batch_size:].zero_()
+            else:
+                pass
+            self.graph.replay()
+        assert self.result_codes is not None
+        assert self.summed_embeddings is not None
+        return (
+            self.result_codes[:live_batch_size],
+            self.summed_embeddings[:live_batch_size],
+        )
+
+
+class ResizeMLP(nn.Module):
+    """Simple Linear-SiLU-Linear projection (used for text/hidden projection).
+    Field names match HF checkpoint: linear_fc1, linear_fc2.
+    """
+
+    def __init__(
+        self,
+        in_size: int,
+        intermediate_size: int,
+        out_size: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.linear_fc1 = ReplicatedLinear(
+            in_size,
+            intermediate_size,
+            bias=True,
+            quant_config=quant_config,
+            prefix=add_prefix("linear_fc1", prefix),
+        )
+        self.act = nn.SiLU()
+        self.linear_fc2 = ReplicatedLinear(
+            intermediate_size,
+            out_size,
+            bias=True,
+            quant_config=quant_config,
+            prefix=add_prefix("linear_fc2", prefix),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out, _ = self.linear_fc1(x)
+        out = self.act(out)
+        out, _ = self.linear_fc2(out)
+        return out
+
+
+class Qwen3OmniMoeTalkerDenseMLP(nn.Module):
+    """Standard SwiGLU MLP."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("gate_up_proj", prefix),
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("down_proj", prefix),
+        )
+        self.act_fn = SiluAndMul()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
+
+
+class Qwen3OmniMoeTalkerSharedExpertMLP(nn.Module):
+    """Shared expert MLP with reduce_results=False for unified all-reduce."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("gate_up_proj", prefix),
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            reduce_results=False,  # Don't all-reduce here; unified with routed experts
+            quant_config=quant_config,
+            prefix=add_prefix("down_proj", prefix),
+        )
+        self.act_fn = SiluAndMul()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
+
+
+class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
+    """MoE block with Shared Expert (Talker-specific).
+
+    Inherits from Thinker's MoE for routed experts (topk, experts, gate).
+    Adds shared expert with gated output.
+
+    Routed and shared expert outputs stay per-rank partial sums until
+    combined; the layer's FFN boundary completes the sum.
+    """
+
+    def __init__(
+        self,
+        layer_id: int,
+        config: Qwen3OmniMoeTalkerTextConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        # Initialize parent (Thinker's MoE: topk, experts, gate)
+        super().__init__(
+            layer_id=layer_id,
+            config=config,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+        # Shared expert (reduce_results=False to avoid double all-reduce)
+        self.shared_expert = Qwen3OmniMoeTalkerSharedExpertMLP(
+            config.hidden_size,
+            config.shared_expert_intermediate_size,
+            quant_config=quant_config,
+            prefix=add_prefix("shared_expert", prefix),
+        )
+        self.shared_expert_gate = ReplicatedLinear(
+            config.hidden_size,
+            1,
+            bias=False,
+            quant_config=None,
+            prefix=add_prefix("shared_expert_gate", prefix),
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+    ) -> torch.Tensor:
+        num_tokens, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        linear_hidden_states = hidden_states
+        linear_dtype = self.shared_expert_gate.weight.dtype
+        if linear_hidden_states.dtype != linear_dtype:
+            linear_hidden_states = linear_hidden_states.to(dtype=linear_dtype)
+        else:
+            pass
+
+        # Shared branch must consume the original MLP input before routed experts.
+        # The fused MoE implementation mutates `hidden_states` in-place.
+        shared_output = self.shared_expert(linear_hidden_states)
+        shared_gate, _ = self.shared_expert_gate(linear_hidden_states)
+        shared_output = shared_output * torch.sigmoid(shared_gate)
+
+        # --- Routed experts (no all-reduce yet) ---
+        router_logits, _ = self.gate(linear_hidden_states)
+        topk_output = self.topk(linear_hidden_states, router_logits)
+        routed_output = self.experts(linear_hidden_states, topk_output)
+
+        final_hidden_states = routed_output + shared_output
+        return final_hidden_states.view(num_tokens, hidden_dim)
+
+
+# ---------------------------------------------------------------------------
+# Talker DecoderLayer (minimal override of Thinker's)
+# ---------------------------------------------------------------------------
+
+
+class Qwen3OmniMoeTalkerDecoderLayer(Qwen3OmniMoeThinkerTextDecoderLayer):
+    """Talker decoder layer with routed and gated shared experts."""
+
+    # note (ratish): avoid constructing discarded experts that stay alive until cyclic gc
+    sparse_moe_block_cls = Qwen3OmniMoeTalkerSparseMoeBlock
+
+
+# ---------------------------------------------------------------------------
+# Talker Text Model
+# ---------------------------------------------------------------------------
+
+
+class Qwen3OmniMoeTalkerTextModel(nn.Module):
+    """Talker's MoE text backbone (20-layer, with shared expert).
+
+    Uses codec_embedding instead of embed_tokens.
+    """
+
+    def __init__(
+        self,
+        config: Qwen3OmniMoeTalkerTextConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.config = config
+        self.vocab_size = config.vocab_size
+
+        # Codec embedding (standard nn.Embedding, not VocabParallel - vocab is small)
+        self.codec_embedding = nn.Embedding(
+            config.vocab_size,
+            config.hidden_size,
+        )
+
+        # Decoder layers
+        alt_stream = torch.cuda.Stream() if current_platform.is_cuda() else None
+        self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: Qwen3OmniMoeTalkerDecoderLayer(
+                config=config,
+                layer_id=idx,
+                quant_config=quant_config,
+                prefix=prefix,
+                alt_stream=alt_stream,
+            ),
+            prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: Qwen3OmniMoeTalkerDecoderLayer.stage_facts(
+                config, idx
+            ),
+        )
+        self.start_layer = 0
+        self.end_layer = config.num_hidden_layers
+
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.layers_to_capture = []
+        max_batch_size = get_schedule().max_running_requests
+        self.cp_enabled = True
+        self.feedback_buffer = torch.zeros(
+            max_batch_size,
+            config.hidden_size,
+            device=self.codec_embedding.weight.device,
+            dtype=self.codec_embedding.weight.dtype,
+        )
+        self.feedback_mask = torch.zeros(
+            max_batch_size,
+            dtype=torch.bool,
+            device=self.codec_embedding.weight.device,
+        )
+
+        # Disable fused_qk_norm_rope so the separate QK-norm + RoPE path is
+        # used.  The fp32 weight promotion + cast_x_before_out_mul is applied
+        # in load_weights() (after weights are loaded from checkpoint).
+        for idx in range(self.start_layer, self.end_layer):
+            self.layers[idx].self_attn.use_fused_qk_norm_rope = False
+            self.layers[idx].self_attn.compatible_with_fused_qk_norm_rope = False
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.codec_embedding
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor] = None,
+    ):
+        if input_embeds is None:
+            hidden_states = self.codec_embedding(input_ids)
+            if self.cp_enabled:
+                bs = hidden_states.shape[0]
+                feedback_mask = self.feedback_mask[:bs]
+                hidden_states = torch.where(
+                    feedback_mask.unsqueeze(-1),
+                    self.feedback_buffer[:bs].to(hidden_states.dtype),
+                    hidden_states,
+                )
+                self.feedback_mask[:bs] = False
+            else:
+                pass
+        else:
+            hidden_states = input_embeds
+
+        residual_batch.start(forward_batch)
+        capture_layers = set(self.layers_to_capture or [])
+        aux_hidden_states = AuxHiddenStateList()
+
+        # Match the hidden-capture contract used by the compare tooling:
+        # layer 0 is the embedding output (input to the first transformer layer).
+        if 0 in capture_layers or "embed" in capture_layers:
+            aux_hidden_states.append(hidden_states.clone())
+        else:
+            pass
+
+        for i in range(self.start_layer, self.end_layer):
+            layer = self.layers[i]
+            hidden_states = layer(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                captured_last_layer_outputs=(
+                    aux_hidden_states if i in capture_layers and i != 0 else None
+                ),
+            )
+
+        hidden_states = residual_batch.final_norm(
+            hidden_states, forward_batch, self.norm, skip_empty=True
+        )
+
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
+        else:
+            pass
+        return hidden_states
+
+
+# ---------------------------------------------------------------------------
+# Code Predictor (single class, matches HF checkpoint structure)
+# ---------------------------------------------------------------------------
+
+
+class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
+    """Code predictor for generating RVQ codes (layers 1 to N-1, N=num_code_groups).
+
+    Matches HF checkpoint structure:
+    - code_predictor.model.codec_embedding: ModuleList[N-1]  (15 embeddings)
+    - code_predictor.model.layers: ModuleList[num_layers]     (5 dense decoder layers)
+    - code_predictor.model.norm: RMSNorm
+    - code_predictor.lm_head: ModuleList[N-1]                 (15 output heads)
+    """
+
+    def __init__(
+        self,
+        config: Qwen3OmniMoeTalkerConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.config = config
+        cp_config = config.code_predictor_config
+
+        # Wrapper to match HF checkpoint path (code_predictor.model.*)
+        self.model = nn.Module()
+
+        # Codec embeddings: 15 embeddings for layers 1-15 (layer 0 uses TextModel's codec_head)
+        self.model.codec_embedding = nn.ModuleList(
+            [
+                nn.Embedding(cp_config.vocab_size, cp_config.hidden_size)
+                for _ in range(config.num_code_groups - 1)
+            ]
+        )
+
+        # 5 dense decoder layers
+        alt_stream = torch.cuda.Stream() if current_platform.is_cuda() else None
+        self.model.layers = nn.ModuleList()
+        for idx in range(cp_config.num_hidden_layers):
+            # Create a decoder layer similar to Thinker but with dense MLP
+            layer = nn.Module()
+            layer.self_attn = Qwen3OmniMoeThinkerTextAttention(
+                hidden_size=cp_config.hidden_size,
+                num_heads=cp_config.num_attention_heads,
+                num_kv_heads=cp_config.num_key_value_heads,
+                layer_id=idx,
+                rope_theta=cp_config.rope_theta,
+                rope_scaling=cp_config.rope_scaling,
+                max_position_embeddings=cp_config.max_position_embeddings,
+                head_dim=cp_config.head_dim,
+                rms_norm_eps=cp_config.rms_norm_eps,
+                attention_bias=cp_config.attention_bias,
+                config=cp_config,
+                quant_config=quant_config,
+                prefix=add_prefix(f"model.layers.{idx}.self_attn", prefix),
+                dual_chunk_attention_config=None,
+                alt_stream=alt_stream,
+            )
+            layer.mlp = Qwen3OmniMoeTalkerDenseMLP(
+                cp_config.hidden_size,
+                cp_config.intermediate_size,
+                quant_config=quant_config,
+                prefix=add_prefix(f"model.layers.{idx}.mlp", prefix),
+            )
+            layer.input_layernorm = RMSNorm(
+                cp_config.hidden_size, eps=cp_config.rms_norm_eps
+            )
+            layer.post_attention_layernorm = RMSNorm(
+                cp_config.hidden_size, eps=cp_config.rms_norm_eps
+            )
+            self.model.layers.append(layer)
+
+        self.model.norm = RMSNorm(cp_config.hidden_size, eps=cp_config.rms_norm_eps)
+
+        # 15 LM heads for predicting layers 1-15
+        self.lm_head = nn.ModuleList(
+            [
+                ReplicatedLinear(
+                    cp_config.hidden_size,
+                    cp_config.vocab_size,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=add_prefix(f"lm_head.{i}", prefix),
+                )
+                for i in range(config.num_code_groups - 1)
+            ]
+        )
+
+    def forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        """
+        Forward through the code predictor (MTP block).
+
+        Args:
+            inputs_embeds: [batch, seq_len, hidden_size] or [total_tokens, hidden_size]
+            positions: [total_tokens] position indices
+            forward_batch: SGLang's forward batch info (None for direct call)
+
+        Returns:
+            hidden_states: same shape as inputs_embeds
+        """
+        if forward_batch is None:
+            return self.forward_direct(inputs_embeds=inputs_embeds, positions=positions)
+        else:
+            pass
+
+        # SGLang layers expect 2D [total_tokens, hidden]; reshape if 3D
+        needs_reshape = inputs_embeds.ndim == 3
+        if needs_reshape:
+            batch_size, seq_len, hidden_size = inputs_embeds.shape
+            hidden_states = inputs_embeds.reshape(-1, hidden_size)
+        else:
+            hidden_states = inputs_embeds
+
+        for layer in self.model.layers:
+            # Pre-norm self-attention with residual
+            residual = hidden_states
+            hidden_states = layer.input_layernorm(hidden_states)
+            hidden_states = layer.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+            hidden_states = residual + hidden_states
+
+            # Pre-norm MLP with residual
+            residual = hidden_states
+            hidden_states = layer.post_attention_layernorm(hidden_states)
+            hidden_states = layer.mlp(hidden_states)
+            hidden_states = residual + hidden_states
+
+        # Final norm
+        hidden_states = self.model.norm(hidden_states)
+
+        if needs_reshape:
+            hidden_states = hidden_states.reshape(batch_size, seq_len, -1)
+        else:
+            pass
+        return hidden_states
+
+    def forward_direct(
+        self,
+        inputs_embeds: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the code predictor without SGLang runtime state.
+
+        The streaming code predictor executor invokes this model directly, so there is
+        no `ForwardBatch` and no KV-cache backend. Fall back to a small eager causal
+        attention path that reuses the loaded SGLang weights.
+        """
+        needs_reshape = inputs_embeds.ndim == 3
+        if needs_reshape:
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = inputs_embeds.unsqueeze(0)
+
+        batch_size, seq_len, hidden_size = hidden_states.shape
+        flat_positions = self.flatten_positions(
+            positions=positions,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            device=hidden_states.device,
+        )
+
+        for layer in self.model.layers:
+            residual = hidden_states
+            normed = layer.input_layernorm(hidden_states.reshape(-1, hidden_size))
+            normed = normed.reshape(batch_size, seq_len, hidden_size)
+            attn_out = self.direct_self_attention(
+                attn=layer.self_attn,
+                hidden_states=normed,
+                positions=flat_positions,
+            )
+            hidden_states = residual + attn_out
+
+            residual = hidden_states
+            normed = layer.post_attention_layernorm(
+                hidden_states.reshape(-1, hidden_size)
+            )
+            mlp_out = layer.mlp(normed).reshape(batch_size, seq_len, hidden_size)
+            hidden_states = residual + mlp_out
+
+        hidden_states = self.model.norm(hidden_states.reshape(-1, hidden_size))
+        hidden_states = hidden_states.reshape(batch_size, seq_len, hidden_size)
+        if needs_reshape:
+            return hidden_states
+        else:
+            pass
+        return hidden_states.squeeze(0)
+
+    def flatten_positions(
+        self,
+        *,
+        positions: torch.Tensor,
+        batch_size: int,
+        seq_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if positions.ndim == 1:
+            if positions.numel() == seq_len and batch_size > 1:
+                positions = positions.unsqueeze(0).expand(batch_size, -1)
+            elif positions.numel() != batch_size * seq_len:
+                raise ValueError(
+                    f"Unexpected positions shape {tuple(positions.shape)} for "
+                    f"batch_size={batch_size}, seq_len={seq_len}"
+                )
+            else:
+                pass
+        elif positions.ndim == 2:
+            if tuple(positions.shape) != (batch_size, seq_len):
+                raise ValueError(
+                    f"Unexpected positions shape {tuple(positions.shape)} for "
+                    f"batch_size={batch_size}, seq_len={seq_len}"
+                )
+            else:
+                pass
+        else:
+            raise ValueError(f"Unsupported positions rank: {positions.ndim}")
+        return positions.to(device=device, dtype=torch.long).reshape(-1)
+
+    @staticmethod
+    def direct_self_attention(
+        *,
+        attn: Qwen3OmniMoeThinkerTextAttention,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size, seq_len, hidden_size = hidden_states.shape
+        flat_hidden = hidden_states.reshape(-1, hidden_size)
+
+        qkv, _ = attn.qkv_proj(flat_hidden)
+        q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
+        q, k = apply_qk_norm(
+            q=q,
+            k=k,
+            q_norm=attn.q_norm,
+            k_norm=attn.k_norm,
+            head_dim=attn.head_dim,
+            alt_stream=attn.alt_stream,
+        )
+        q, k = attn.rotary_emb(positions, q, k, fused_set_kv_buffer_arg=None)
+
+        q = q.reshape(batch_size, seq_len, attn.num_heads, attn.head_dim).transpose(
+            1, 2
+        )
+        k = k.reshape(batch_size, seq_len, attn.num_kv_heads, attn.head_dim).transpose(
+            1, 2
+        )
+        v = v.reshape(batch_size, seq_len, attn.num_kv_heads, attn.head_dim).transpose(
+            1, 2
+        )
+
+        # Use SDPA to match HF's attention computation
+        # note (EdwardZhang1108): enable_gqa broadcasts KV heads in-kernel (#1145)
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            is_causal=True,
+            enable_gqa=attn.num_heads != attn.num_kv_heads,
+        )
+        attn_output = attn_output.transpose(1, 2).reshape(
+            batch_size * seq_len, attn.num_heads * attn.head_dim
+        )
+        attn_output, _ = attn.o_proj(attn_output)
+        return attn_output.reshape(batch_size, seq_len, hidden_size)
+
+
+# ---------------------------------------------------------------------------
+# Top-level Talker Model
+# ---------------------------------------------------------------------------
+
+
+class Qwen3OmniTalker(nn.Module):
+    """Talker: Text-to-Audio generation model."""
+
+    def __init__(
+        self,
+        config,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        if not isinstance(config, Qwen3OmniMoeTalkerConfig):
+            self.root_config = config
+            config = Qwen3OmniMoeTalkerConfig(**config.talker_config.to_dict())
+        else:
+            self.root_config = config
+        self.config = config
+
+        # Projection MLPs (thinker hidden -> talker hidden)
+        self.text_projection = ResizeMLP(
+            config.thinker_hidden_size,
+            config.text_config.intermediate_size,
+            config.text_config.hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("text_projection", prefix),
+        )
+        self.hidden_projection = ResizeMLP(
+            config.thinker_hidden_size,
+            config.text_config.intermediate_size,
+            config.text_config.hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("hidden_projection", prefix),
+        )
+
+        # Main components
+        self.model = Qwen3OmniMoeTalkerTextModel(
+            config.text_config,
+            quant_config=quant_config,
+            prefix=add_prefix("model", prefix),
+        )
+        # True only if the backbone uses MRotaryEmbedding (3D positions).
+        # Otherwise it uses a plain RotaryEmbedding that needs 1D positions.
+        self.uses_mrope = any(
+            isinstance(layer.self_attn.rotary_emb, MRotaryEmbedding)
+            for layer in self.model.layers
+        )
+        # The prefill CUDA graph runner picks capture-time positions by probing
+        # this; if it disagrees with forward() below, MRotaryEmbedding takes its
+        # out-of-place path and the rebuilt q/k do not survive a graph-segment
+        # boundary, leaving attention to run on zeros.
+        self.is_mrope_enabled = self.uses_mrope
+        self.codec_head = ReplicatedLinear(
+            config.text_config.hidden_size,
+            config.text_config.vocab_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("codec_head", prefix),
+        )
+        self.code_predictor = Qwen3OmniMoeTalkerCodePredictor(
+            config,
+            quant_config=quant_config,
+            prefix=add_prefix("code_predictor", prefix),
+        )
+
+        device = self.model.codec_embedding.weight.device
+        hidden_size = config.text_config.hidden_size
+        predictor_len = config.num_code_groups + 1
+        server_args = get_context().server_args
+        max_batch_size = get_schedule().max_running_requests
+        self.cp_enabled = self.model.cp_enabled
+        self.feedback_buffer = self.model.feedback_buffer
+        self.feedback_mask = self.model.feedback_mask
+        # note (ratish): two slots, the talker hidden and the layer-0 embedding; the
+        # later codebook embeddings feed their forwards directly.
+        self.predictor_input_buffer = torch.zeros(
+            max_batch_size,
+            2,
+            hidden_size,
+            device=device,
+            dtype=self.model.codec_embedding.weight.dtype,
+        )
+        self.predictor_positions = torch.arange(
+            predictor_len,
+            device=device,
+            dtype=torch.long,
+        )
+        predictor_num_layers = len(self.code_predictor.model.layers)
+        predictor_attention = self.code_predictor.model.layers[0].self_attn
+        # note (ratish): slot major, so the rope kernel stores k and v as one row
+        # per (batch row, slot) and the attention reads a transposed view.
+        self.predictor_k_cache = torch.zeros(
+            predictor_num_layers,
+            max_batch_size,
+            predictor_len,
+            predictor_attention.num_kv_heads,
+            predictor_attention.head_dim,
+            device=device,
+            dtype=self.model.codec_embedding.weight.dtype,
+        )
+        self.predictor_v_cache = torch.zeros_like(self.predictor_k_cache)
+        self.predictor_k_rows = [
+            layer_cache.view(max_batch_size * predictor_len, -1)
+            for layer_cache in self.predictor_k_cache
+        ]
+        self.predictor_v_rows = [
+            layer_cache.view(max_batch_size * predictor_len, -1)
+            for layer_cache in self.predictor_v_cache
+        ]
+        self.predictor_cache_slots = (
+            torch.arange(max_batch_size, device=device, dtype=torch.long)[None, :]
+            * predictor_len
+            + self.predictor_positions[:, None]
+        ).contiguous()
+        self.predictor_rope_stores_kv = self.resolve_predictor_rope_store(
+            predictor_attention, device=device
+        )
+        self.predictor_position_rows = (
+            self.predictor_positions[:, None]
+            .expand(predictor_len, max_batch_size)
+            .contiguous()
+        )
+        # note (ratish): the opening pair runs as one causal pass, its rows laid out
+        # (row, token) major.
+        self.predictor_pair_positions = self.predictor_positions[:2].repeat(
+            max_batch_size
+        )
+        self.predictor_pair_cache_slots = (
+            self.predictor_cache_slots[:2, :].t().reshape(-1).contiguous()
+        )
+        self.predictor_fused_layers = resolve_fused_predictor_layers(
+            self.code_predictor,
+            predictor_len,
+            max_batch_size,
+            device,
+            self.model.codec_embedding.weight.dtype,
+        )
+        # note (ratish): where the exact kernel does not apply, the add and the norm
+        # stay two launches.
+        self.predictor_exact_add_norm = supports_exact_add_rmsnorm(
+            hidden_size, self.model.codec_embedding.weight.dtype, device
+        )
+        self.sampled_token_ids = torch.zeros(
+            max_batch_size,
+            dtype=torch.long,
+            device=device,
+        )
+        self.repetition_mask = torch.zeros(
+            max_batch_size,
+            config.text_config.vocab_size,
+            dtype=torch.bool,
+            device=device,
+        )
+        self.repetition_penalties = torch.ones(
+            max_batch_size,
+            1,
+            dtype=torch.float32,
+            device=device,
+        )
+        self.suppress_mask = torch.zeros(
+            max_batch_size,
+            config.text_config.vocab_size,
+            dtype=torch.bool,
+            device=device,
+        )
+        self.sampling_temperatures = torch.ones(
+            max_batch_size,
+            1,
+            dtype=torch.float32,
+            device=device,
+        )
+        self.sampling_top_ps = torch.ones(
+            max_batch_size,
+            dtype=torch.float32,
+            device=device,
+        )
+        self.sampling_top_ks = torch.full(
+            (max_batch_size,),
+            1,
+            dtype=torch.int32,
+            device=device,
+        )
+        self.sampling_min_ps = torch.zeros(
+            max_batch_size,
+            dtype=torch.float32,
+            device=device,
+        )
+        self.sampling_seeds = torch.zeros(
+            max_batch_size,
+            dtype=torch.int64,
+            device=device,
+        )
+        # Note (akazaakane): int64-typed; rows 0-3 hold floats bit-cast via
+        # .view(torch.float64) so one copy covers both float and int params.
+        # Note (akazaakane): device="cpu" is required — model init runs under
+        # a cuda default-device context, and only CPU tensors can be pinned.
+        self.sampling_staging_cpu = torch.zeros(
+            6,
+            max_batch_size,
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=device.type == "cuda",
+        )
+        self.sampling_staging_gpu = torch.zeros(
+            6,
+            max_batch_size,
+            dtype=torch.int64,
+            device=device,
+        )
+        self.sampling_staging_event = (
+            torch.get_device_module().Event() if device.type != "cpu" else None
+        )
+        self.decode_prep_rids: list[str] | None = None
+        self.decode_prep_out_lens: list[int] = []
+        self.decode_prep_rep_rows: torch.Tensor | None = None
+        self.output_codes = torch.zeros(
+            max_batch_size,
+            config.num_code_groups,
+            dtype=torch.long,
+            device=device,
+        )
+        self.output_embeds = torch.zeros(
+            max_batch_size,
+            hidden_size,
+            device=device,
+            dtype=self.model.codec_embedding.weight.dtype,
+        )
+        self.predictor_decode_graph_batch_sizes = (
+            self.normalize_predictor_decode_graph_batch_sizes(
+                server_args,
+                max_batch_size=max_batch_size,
+            )
+        )
+        self.predictor_decode_graphs: dict[
+            tuple[int, torch.dtype], PredictorDecodeGraph
+        ] = {}
+        self.predictor_decode_graph_disabled: set[tuple[int, torch.dtype]] = set()
+        bind_default_weight_loaders(self)
+        self.cached_params_dict = dict(self.named_parameters())
+        self.sampler = None
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.get_input_embeddings()
+
+    @property
+    def activation_dtype(self) -> torch.dtype:
+        return self.model.codec_embedding.weight.dtype
+
+    @staticmethod
+    def sample_code_predictor_token(logits: torch.Tensor) -> torch.Tensor:
+        # Match HF generate(do_sample=False, temperature=0.0) behavior for the
+        # residual code predictor by taking the highest-logit token directly.
+        next_code = torch.argmax(logits[:, -1, :], dim=-1)
+        if next_code.ndim == 1:
+            next_code = next_code.unsqueeze(-1)
+        else:
+            pass
+        return next_code
+
+    def reuse_decode_buffers(self, requests: list) -> bool:
+        # Note (akazaakane): sampling params/suppress mask are static per
+        # request, so only the repetition mask needs updating here.
+        prev_rids = self.decode_prep_rids
+        if prev_rids is None or len(prev_rids) != len(requests):
+            return False
+        else:
+            pass
+        prev_lens = self.decode_prep_out_lens
+        for row_idx, sched_req in enumerate(requests):
+            req = sched_req.data.req
+            if req.rid != prev_rids[row_idx]:
+                return False
+            else:
+                pass
+            out_len = len(req.output_ids) if req.output_ids else 0
+            if out_len != prev_lens[row_idx] + 1:
+                return False
+            else:
+                pass
+
+        rep_rows = self.decode_prep_rep_rows
+        if rep_rows is not None:
+            self.repetition_mask[rep_rows, self.sampled_token_ids[rep_rows]] = True
+        else:
+            pass
+        for row_idx in range(len(prev_lens)):
+            prev_lens[row_idx] += 1
+        return True
+
+    def invalidate_decode_buffers(self) -> None:
+        # Note (akazaakane): a prefill's sampled token bypasses
+        # _sampled_token_ids, so the fast path must not run right after one.
+        self.decode_prep_rids = None
+
+    def prepare_decode_buffers(self, requests: list) -> None:
+        batch_size = len(requests)
+        if batch_size == 0:
+            return
+        else:
+            pass
+
+        if self.reuse_decode_buffers(requests):
+            return
+        else:
+            pass
+
+        device = self.repetition_mask.device
+        rep_vocab = self.repetition_mask.shape[1]
+        sup_vocab = self.suppress_mask.shape[1]
+
+        self.repetition_mask[:batch_size] = False
+        self.suppress_mask[:batch_size] = False
+
+        rep_penalties: list[float] = []
+        temperatures: list[float] = []
+        top_ps: list[float] = []
+        top_ks: list[int] = []
+        min_ps: list[float] = []
+        sampling_seeds: list[int] = []
+        rep_rows: list[int] = []
+        rep_toks: list[int] = []
+        sup_rows: list[int] = []
+        sup_toks: list[int] = []
+
+        for row_idx, sched_req in enumerate(requests):
+            data = sched_req.data
+            req = data.req
+            sp = req.sampling_params
+
+            penalty = float(sp.repetition_penalty)
+            rep_penalties.append(penalty)
+            temperatures.append(float(sp.temperature))
+            top_ps.append(float(sp.top_p))
+            top_ks.append(int(sp.top_k))
+            min_ps.append(float(sp.min_p))
+            # Unseeded: rank-shared seed from the request id (same on every TP
+            # rank), not os.urandom, else the ranks desync.
+            seed = sp.sampling_seed
+            if seed is None:
+                seed = derive_sampling_seed("sglang-omni-unseeded-row", req.rid)
+            elif not (0 <= seed <= SAMPLING_SEED_MASK):
+                seed = resolve_row_seed(seed)
+                sp.sampling_seed = seed
+            else:
+                pass
+            sampling_seeds.append(seed)
+
+            if penalty != 1.0 and req.output_ids:
+                unique = {
+                    t
+                    for t in (int(tok) for tok in req.output_ids)
+                    if 0 <= t < rep_vocab
+                }
+                if unique:
+                    rep_rows.extend([row_idx] * len(unique))
+                    rep_toks.extend(unique)
+                else:
+                    pass
+            else:
+                pass
+
+            suppress_tokens = (
+                data.suppress_tokens or req._codec_suppress_tokens
+            )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+            if suppress_tokens:
+                valid_sup = [
+                    t
+                    for t in (int(tok) for tok in suppress_tokens)
+                    if 0 <= t < sup_vocab
+                ]
+                if valid_sup:
+                    sup_rows.extend([row_idx] * len(valid_sup))
+                    sup_toks.extend(valid_sup)
+                else:
+                    pass
+            else:
+                pass
+
+        if self.sampling_staging_event is not None:
+            # Note (akazaakane): guards the prior async copy still reading
+            # this buffer before we overwrite it.
+            self.sampling_staging_event.synchronize()
+        else:
+            pass
+        staging_cpu = self.sampling_staging_cpu
+        staging_cpu_f64 = staging_cpu.view(torch.float64)
+        staging_cpu_f64[0, :batch_size] = torch.tensor(
+            rep_penalties, dtype=torch.float64
+        )
+        staging_cpu_f64[1, :batch_size] = torch.tensor(
+            temperatures, dtype=torch.float64
+        )
+        staging_cpu_f64[2, :batch_size] = torch.tensor(top_ps, dtype=torch.float64)
+        staging_cpu_f64[3, :batch_size] = torch.tensor(min_ps, dtype=torch.float64)
+        staging_cpu[4, :batch_size] = torch.tensor(top_ks, dtype=torch.int64)
+        staging_cpu[5, :batch_size] = torch.tensor(sampling_seeds, dtype=torch.int64)
+        staging_gpu = self.sampling_staging_gpu
+        staging_gpu.copy_(staging_cpu, non_blocking=True)
+        if self.sampling_staging_event is not None:
+            self.sampling_staging_event.record()
+        else:
+            pass
+        staging_gpu_f64 = staging_gpu.view(torch.float64)
+        self.repetition_penalties[:batch_size, 0].copy_(staging_gpu_f64[0, :batch_size])
+        self.sampling_temperatures[:batch_size, 0].copy_(
+            staging_gpu_f64[1, :batch_size]
+        )
+        self.sampling_top_ps[:batch_size].copy_(staging_gpu_f64[2, :batch_size])
+        self.sampling_min_ps[:batch_size].copy_(staging_gpu_f64[3, :batch_size])
+        self.sampling_top_ks[:batch_size].copy_(staging_gpu[4, :batch_size])
+        self.sampling_seeds[:batch_size].copy_(staging_gpu[5, :batch_size])
+
+        if rep_rows:
+            rep_pairs = torch.tensor(
+                rep_rows + rep_toks, dtype=torch.long, device=device
+            )
+            self.repetition_mask[
+                rep_pairs[: len(rep_rows)], rep_pairs[len(rep_rows) :]
+            ] = True
+        else:
+            pass
+
+        if sup_rows:
+            sup_pairs = torch.tensor(
+                sup_rows + sup_toks, dtype=torch.long, device=device
+            )
+            self.suppress_mask[
+                sup_pairs[: len(sup_rows)], sup_pairs[len(sup_rows) :]
+            ] = True
+        else:
+            pass
+
+        self.decode_prep_rids = [sched_req.data.req.rid for sched_req in requests]
+        self.decode_prep_out_lens = [
+            len(sched_req.data.req.output_ids) if sched_req.data.req.output_ids else 0
+            for sched_req in requests
+        ]
+        rep_active_rows = [
+            row_idx for row_idx, penalty in enumerate(rep_penalties) if penalty != 1.0
+        ]
+        self.decode_prep_rep_rows = (
+            torch.tensor(rep_active_rows, dtype=torch.long, device=device)
+            if rep_active_rows
+            else None
+        )
+
+    def prepare_input_embeds(
+        self,
+        thinker_embeds: Optional[torch.Tensor] = None,
+        thinker_hidden_states: Optional[torch.Tensor] = None,
+        is_multimodal_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Project thinker outputs to talker's hidden dimension.
+
+        - Text positions:       text_projection(thinker_embeds)
+        - Multimodal positions:  hidden_projection(thinker_hidden_states)
+
+        If no mask is provided, all positions use text_projection.
+        """
+        if thinker_hidden_states is None or is_multimodal_mask is None:
+            return self.text_projection(thinker_embeds)
+        else:
+            pass
+        if thinker_embeds is None:
+            return self.hidden_projection(thinker_hidden_states)
+        else:
+            pass
+
+        # Mixed: use mask to select projection
+        output = torch.empty(
+            (*thinker_embeds.shape[:-1], self.config.text_config.hidden_size),
+            device=thinker_embeds.device,
+            dtype=thinker_embeds.dtype,
+        )
+        if is_multimodal_mask.any():
+            output[is_multimodal_mask] = self.hidden_projection(
+                thinker_hidden_states[is_multimodal_mask]
+            )
+        else:
+            pass
+        text_mask = ~is_multimodal_mask
+        if text_mask.any():
+            output[text_mask] = self.text_projection(thinker_embeds[text_mask])
+        else:
+            pass
+        return output
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor] = None,
+        input_deepstack_embeds: Optional[torch.Tensor] = None,
+        input_deepstack_mask: Optional[torch.Tensor] = None,
+        input_embeds_are_projected: bool = False,
+        omni_prefill_rids: Optional[list[str] | tuple[str, ...]] = None,
+    ):
+        """Forward pass through the talker MoE backbone.
+
+        When input_embeds is provided (prefill with thinker hidden states),
+        project them via prepare_input_embeds before running the backbone.
+
+        Args:
+            input_ids: codec token ids (used during decode)
+            positions: position indices
+            forward_batch: SGLang's forward batch info
+            input_embeds: thinker hidden states [total_tokens, thinker_hidden_size]
+                          (provided by SGLang when Req.input_embeds is set)
+            input_deepstack_embeds: optional layer-N thinker hidden states
+            input_deepstack_mask: positions that should use hidden_projection
+            input_embeds_are_projected: whether `input_embeds` is already in talker space
+            omni_prefill_rids: request ids SGLModelRunner forwards alongside the
+                Omni prefill sidecar; the talker keys nothing off them
+
+        Returns:
+            LogitsProcessorOutput with codec logits
+        """
+        del omni_prefill_rids
+        if forward_batch.forward_mode.is_extend():
+            self.invalidate_decode_buffers()
+        else:
+            pass
+
+        if input_embeds is not None and not input_embeds_are_projected:
+            # Prefill: project thinker hidden states → talker dimension
+            deepstack_hidden = input_deepstack_embeds
+            deepstack_mask = input_deepstack_mask
+            if deepstack_hidden is not None and deepstack_mask is not None:
+                input_embeds = self.prepare_input_embeds(
+                    thinker_embeds=input_embeds,
+                    thinker_hidden_states=deepstack_hidden,
+                    is_multimodal_mask=deepstack_mask,
+                )
+            else:
+                input_embeds = self.prepare_input_embeds(thinker_embeds=input_embeds)
+        else:
+            pass
+
+        # Use 3D mrope_positions only when the backbone is mrope; the plain
+        # RotaryEmbedding path needs the 1D positions instead.
+        if self.uses_mrope and forward_batch.mrope_positions is not None:
+            positions = forward_batch.mrope_positions.contiguous()
+        else:
+            positions = forward_batch.positions
+
+        hidden_states = self.model(
+            input_ids=input_ids,
+            positions=positions,
+            forward_batch=forward_batch,
+            input_embeds=input_embeds,
+        )
+        if forward_batch.forward_mode.is_extend() and input_embeds is not None:
+            return self.manual_extend_logits(hidden_states, forward_batch)
+        else:
+            pass
+        logits_output = self.manual_decode_logits(hidden_states)
+        if forward_batch.forward_mode.is_decode():
+            sampled_token_ids = self.sample_decode_tokens(
+                logits_output.next_token_logits,
+                forward_batch,
+            )
+            batch_size = sampled_token_ids.shape[0]
+            self.sampled_token_ids[:batch_size].copy_(sampled_token_ids)
+            self.code_predictor_forward(
+                sampled_token_ids.unsqueeze(1),
+                hidden_states.unsqueeze(1),
+            )
+        else:
+            pass
+        return logits_output
+
+    def manual_extend_logits(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> LogitsProcessorOutput:
+        """Compute next-token logits for talker prefill without LogitsProcessor.
+
+        The projected-prompt prefill path only needs next-token logits. Using a
+        tiny local implementation avoids the generic SGLang logits processor path
+        that currently fails on this extend batch.
+        """
+        last_index = self.extend_last_index(forward_batch, hidden_states.device)
+        pruned_states = hidden_states[last_index]
+        next_token_logits, _ = self.codec_head(pruned_states)
+        return LogitsProcessorOutput(
+            next_token_logits=next_token_logits.float(),
+            hidden_states=pruned_states,
+        )
+
+    def manual_decode_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> LogitsProcessorOutput:
+        """Compute codec logits directly for decode/CUDA-graph capture."""
+        next_token_logits, _ = self.codec_head(hidden_states)
+        # note (ratish): sglang's sampler divides and softmaxes in the logits' own dtype.
+        # The reference samples from fp32 logits, as sglang's logits processor returns them.
+        return LogitsProcessorOutput(
+            next_token_logits=next_token_logits.float(),
+            hidden_states=hidden_states,
+        )
+
+    def sample_decode_tokens(
+        self,
+        logits: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        batch_size = logits.shape[0]
+        penalties = self.repetition_penalties[:batch_size]
+        penalized_logits = torch.where(
+            logits > 0, logits / penalties, logits * penalties
+        )
+        logits = torch.where(
+            self.repetition_mask[:batch_size], penalized_logits, logits
+        )
+        logits = logits.masked_fill(self.suppress_mask[:batch_size], float("-inf"))
+
+        logits_output = LogitsProcessorOutput(
+            next_token_logits=logits,
+            hidden_states=None,
+        )
+        if self.sampler is None:
+            return torch.argmax(logits, dim=-1)
+        else:
+            pass
+        sampling_info = self.build_static_sampling_info(batch_size)
+        sampled = self.sampler(
+            logits_output,
+            sampling_info,
+            False,
+            [0] * batch_size,
+            [[] for _ in range(batch_size)],
+            forward_batch.positions,
+        )
+        if sampled.ndim > 1:
+            sampled = sampled.squeeze(-1)
+        else:
+            pass
+        return sampled
+
+    def build_static_sampling_info(self, batch_size: int) -> SamplingBatchInfo:
+        return SamplingBatchInfo(
+            temperatures=self.sampling_temperatures[:batch_size],
+            top_ps=self.sampling_top_ps[:batch_size],
+            top_ks=self.sampling_top_ks[:batch_size],
+            min_ps=self.sampling_min_ps[:batch_size],
+            # Keep sampler control flow static during graph capture while
+            # preserving SGLang's actual sampling kernel semantics.
+            is_all_greedy=False,
+            # A required field. Only the dspark speculative
+            # verify path reads it (the regular sampler branches on
+            # is_all_greedy alone), and this scheduler refuses speculative
+            # decoding, so False is inert here -- it also matches what upstream
+            # itself passes for the equivalent static, capture-time info in
+            # eagle_draft_cuda_graph_runner.
+            is_any_greedy=False,
+            need_top_p_sampling=True,
+            need_top_k_sampling=True,
+            need_min_p_sampling=False,
+            vocab_size=self.config.text_config.vocab_size,
+            grammars=[],
+            penalizer_orchestrator=None,
+            has_custom_logit_processor=False,
+            custom_params=None,
+            custom_logit_processor=None,
+            sampling_seed=self.sampling_seeds[:batch_size],
+            device=current_platform.device_type,
+            logit_bias=None,
+        )
+
+    def extend_last_index(
+        self,
+        forward_batch: ForwardBatch,
+        device: torch.device,
+    ) -> torch.Tensor:
+        extend_seq_lens = forward_batch.extend_seq_lens
+        if extend_seq_lens is None:
+            return torch.tensor([forward_batch.input_ids.shape[0] - 1], device=device)
+        else:
+            pass
+
+        # The static-padded variant that used ForwardBatch.padded_static_len is
+        # gone: only the EAGLE draft-extend graph runners ever set that field,
+        # and the talker refuses speculative decoding, so it was always -1 here.
+        seq_lens = extend_seq_lens.to(device=device)
+        return torch.cumsum(seq_lens, dim=0) - 1
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Compute layer-0 codec logits."""
+        logits, _ = self.codec_head(hidden_states)
+        return logits
+
+    def code_predictor_forward_incremental(
+        self,
+        layer0_codes: torch.Tensor,
+        talker_hidden: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run the predictor one token at a time using a per-layer single-turn KV cache."""
+        if layer0_codes.ndim == 1:
+            layer0_codes = layer0_codes.unsqueeze(1)
+        else:
+            pass
+        if talker_hidden.ndim == 2:
+            talker_hidden = talker_hidden.unsqueeze(1)
+        else:
+            pass
+
+        batch_size, seq_len = layer0_codes.shape
+        if talker_hidden.shape[:2] != (batch_size, seq_len):
+            raise ValueError(
+                "talker_hidden shape must align with layer0_codes: "
+                f"{tuple(talker_hidden.shape)} vs {tuple(layer0_codes.shape)}"
+            )
+        else:
+            pass
+        if self.can_use_predictor_decode_graph(
+            layer0_codes=layer0_codes,
+            talker_hidden=talker_hidden,
+            seq_len=seq_len,
+        ):
+            graph_result = self.code_predictor_forward_single_token_graph(
+                layer0_codes=layer0_codes,
+                talker_hidden=talker_hidden,
+                batch_size=batch_size,
+                code_dtype=layer0_codes.dtype,
+            )
+            if graph_result is not None:
+                return graph_result
+            else:
+                pass
+        else:
+            pass
+
+        return self.code_predictor_forward_incremental_eager(
+            layer0_codes=layer0_codes,
+            talker_hidden=talker_hidden,
+        )
+
+    def can_use_predictor_decode_graph(
+        self,
+        *,
+        layer0_codes: torch.Tensor,
+        talker_hidden: torch.Tensor,
+        seq_len: int,
+    ) -> bool:
+        if seq_len != 1:
+            return False
+        else:
+            pass
+        if layer0_codes.dtype not in (torch.int, torch.long):
+            return False
+        else:
+            pass
+        if not torch.cuda.is_available():
+            return False
+        else:
+            pass
+        if not layer0_codes.is_cuda or not talker_hidden.is_cuda:
+            return False
+        else:
+            pass
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        else:
+            pass
+        # Note (zijiecode): SGLang's decode-graph warmup runs this forward before
+        # its own capture. On ROCm (torch 2.9) the predictor must not register
+        # the CUDA generator first, or SGLang's no_grad capture_begin() fails
+        # on the inference tensors it left behind. CUDA keeps the startup-time
+        # capture.
+        if current_platform.is_rocm() and get_is_capture_mode():
+            return False
+        else:
+            pass
+        return True
+
+    @staticmethod
+    def normalize_predictor_decode_graph_batch_sizes(
+        server_args: ServerArgs,
+        *,
+        max_batch_size: int,
+    ) -> tuple[int, ...]:
+        from sglang_omni.scheduling.generation_batch_policy import (
+            get_decode_cuda_graph_bs,
+        )
+
+        raw_batch_sizes = get_decode_cuda_graph_bs(server_args)
+        if raw_batch_sizes is None:
+            raw_batch_sizes = (max_batch_size,)
+        else:
+            pass
+
+        normalized = sorted(
+            {
+                int(batch_size)
+                for batch_size in raw_batch_sizes
+                if 1 <= int(batch_size) <= int(max_batch_size)
+            }
+        )
+        if not normalized or normalized[-1] < int(max_batch_size):
+            normalized.append(int(max_batch_size))
+        else:
+            pass
+        return tuple(normalized)
+
+    def predictor_decode_graph_bucket_size(self, batch_size: int) -> int | None:
+        for bucket_size in self.predictor_decode_graph_batch_sizes:
+            if bucket_size >= batch_size:
+                return bucket_size
+            else:
+                pass
+        return None
+
+    def code_predictor_forward_single_token_graph(
+        self,
+        *,
+        layer0_codes: torch.Tensor,
+        talker_hidden: torch.Tensor,
+        batch_size: int,
+        code_dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor] | None:
+        bucket_size = self.predictor_decode_graph_bucket_size(batch_size)
+        if bucket_size is None:
+            return None
+        else:
+            pass
+
+        key = (bucket_size, code_dtype)
+        if key in self.predictor_decode_graph_disabled:
+            return None
+        else:
+            pass
+
+        graph = self.predictor_decode_graphs.get(key)
+        if graph is None:
+            try:
+                graph = PredictorDecodeGraph(self, bucket_size, code_dtype)
+            except Exception:
+                self.predictor_decode_graph_disabled.add(key)
+                logger.warning(
+                    "Disabling Qwen3-Omni predictor CUDA graph for "
+                    "batch_size=%s dtype=%s",
+                    bucket_size,
+                    code_dtype,
+                    exc_info=True,
+                )
+                return None
+            self.predictor_decode_graphs[key] = graph
+            logger.info(
+                "Captured Qwen3-Omni predictor CUDA graph for batch_size=%s "
+                "dtype=%s",
+                bucket_size,
+                code_dtype,
+            )
+        else:
+            pass
+
+        return graph.replay(layer0_codes, talker_hidden)
+
+    def code_predictor_forward_incremental_eager(
+        self,
+        layer0_codes: torch.Tensor,
+        talker_hidden: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Eager predictor implementation used for prefill and graph fallback."""
+        if layer0_codes.ndim == 1:
+            layer0_codes = layer0_codes.unsqueeze(1)
+        else:
+            pass
+        if talker_hidden.ndim == 2:
+            talker_hidden = talker_hidden.unsqueeze(1)
+        else:
+            pass
+
+        batch_size, seq_len = layer0_codes.shape
+        if talker_hidden.shape[:2] != (batch_size, seq_len):
+            raise ValueError(
+                "talker_hidden shape must align with layer0_codes: "
+                f"{tuple(talker_hidden.shape)} vs {tuple(layer0_codes.shape)}"
+            )
+        else:
+            pass
+
+        predictor_input = self.predictor_input_buffer[:batch_size]
+        num_groups = self.config.num_code_groups
+        runtime_single_token = seq_len == 1
+        if runtime_single_token:
+            self.output_codes[:batch_size].zero_()
+            self.output_embeds[:batch_size].zero_()
+            result_codes = self.output_codes[:batch_size].unsqueeze(-1)
+            summed_embeddings = self.output_embeds[:batch_size].unsqueeze(1)
+        else:
+            result_codes = torch.empty(
+                (batch_size, num_groups, seq_len),
+                dtype=torch.long,
+                device=layer0_codes.device,
+            )
+            summed_embeddings = torch.zeros(
+                (batch_size, seq_len, predictor_input.shape[-1]),
+                dtype=predictor_input.dtype,
+                device=predictor_input.device,
+            )
+
+        for pos in range(seq_len):
+            layer0_code = layer0_codes[:, pos : pos + 1]
+            layer0_embed = self.get_input_embeddings()(layer0_code).to(
+                dtype=predictor_input.dtype
+            )
+            pos_codes = result_codes[:, :, pos]
+            pos_summed = summed_embeddings[:, pos, :]
+            predictor_input[:, 0, :] = talker_hidden[:, pos, :].to(
+                dtype=predictor_input.dtype
+            )
+            predictor_input[:, 1, :] = layer0_embed[:, 0, :]
+            pos_codes[:, 0].copy_(layer0_code[:, 0])
+            pos_summed.add_(layer0_embed[:, 0, :])
+
+            cache_len = 0
+            pair_hidden = self.predictor_forward_tokens(
+                token_embeds=predictor_input[:, 0:2, :],
+                batch_size=batch_size,
+                cache_len=cache_len,
+            )
+            last_hidden = pair_hidden[:, 1:2, :].contiguous()
+            cache_len += 2
+
+            for layer_idx in range(num_groups - 1):
+                logits, _ = self.code_predictor.lm_head[layer_idx](last_hidden)
+                codebook_embedding = self.code_predictor.model.codec_embedding[
+                    layer_idx
+                ]
+                # note (ratish): the codebook step runs where the fused layers do, on CUDA
+                # with Triton; the checkpoint's bf16 tables are 2048 by 1024, the
+                # power-of-two widths it needs.
+                if self.predictor_fused_layers is not None:
+                    new_embed = codebook_step(
+                        logits[:, -1, :],
+                        codebook_embedding.weight,
+                        pos_codes[:, layer_idx + 1],
+                        pos_summed,
+                    )
+                else:
+                    next_code = self.sample_code_predictor_token(logits)
+                    pos_codes[:, layer_idx + 1].copy_(next_code[:, 0])
+                    new_embed = codebook_embedding(next_code).to(
+                        dtype=predictor_input.dtype
+                    )
+                    pos_summed.add_(new_embed[:, 0, :])
+                if layer_idx < num_groups - 2:
+                    last_hidden = self.predictor_forward_tokens(
+                        token_embeds=new_embed,
+                        batch_size=batch_size,
+                        cache_len=cache_len,
+                    )
+                    cache_len += 1
+                else:
+                    pass
+
+        return result_codes, summed_embeddings
+
+    def predictor_forward_tokens(
+        self,
+        *,
+        token_embeds: torch.Tensor,
+        batch_size: int,
+        cache_len: int,
+    ) -> torch.Tensor:
+        """Run one token per row against the cached prefix, or the opening pair of
+        tokens per row as one causal pass when the cache is empty."""
+        seq_len, hidden_size = token_embeds.shape[1:]
+        if seq_len == 1:
+            positions = self.predictor_position_rows[cache_len, :batch_size]
+            cache_slots = self.predictor_cache_slots[cache_len, :batch_size]
+        elif seq_len == 2 and cache_len == 0:
+            positions = self.predictor_pair_positions[: 2 * batch_size]
+            cache_slots = self.predictor_pair_cache_slots[: 2 * batch_size]
+        else:
+            raise ValueError(
+                "the predictor runs one token per row, or two at an empty cache: "
+                f"got seq_len={seq_len} at cache_len={cache_len}"
+            )
+        fused = self.predictor_fused_layers
+        if fused is not None and fused.covers(batch_size * seq_len):
+            return fused.forward(
+                layers=self.code_predictor.model.layers,
+                final_norm=self.code_predictor.model.norm,
+                token_embeds=token_embeds,
+                batch_size=batch_size,
+                cache_len=cache_len,
+                positions=positions,
+                k_cache=self.predictor_k_cache,
+                v_cache=self.predictor_v_cache,
+            )
+        else:
+            pass
+        hidden_states = token_embeds.reshape(-1, hidden_size)
+        residual = None
+
+        for layer_idx, layer in enumerate(self.code_predictor.model.layers):
+            if residual is None:
+                residual = hidden_states
+                normed = layer.input_layernorm(hidden_states)
+            else:
+                normed, residual = self.predictor_add_norm(
+                    layer.input_layernorm, hidden_states, residual
+                )
+            attn_out = self.predictor_cached_self_attention(
+                layer_idx=layer_idx,
+                attn=layer.self_attn,
+                hidden_states=normed.reshape(batch_size, seq_len, hidden_size),
+                positions=positions,
+                cache_slots=cache_slots,
+                batch_size=batch_size,
+                cache_len=cache_len,
+            )
+            normed, residual = self.predictor_add_norm(
+                layer.post_attention_layernorm,
+                attn_out.reshape(-1, hidden_size),
+                residual,
+            )
+            hidden_states = layer.mlp(normed)
+
+        hidden_states, _ = self.predictor_add_norm(
+            self.code_predictor.model.norm, hidden_states, residual
+        )
+        return hidden_states.reshape(batch_size, seq_len, hidden_size)
+
+    def predictor_add_norm(
+        self, norm: RMSNorm, hidden_states: torch.Tensor, residual: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """residual + hidden_states, then the norm of the rounded sum, as the plain
+        path computes it; one launch where the exact kernel applies, else two."""
+        if self.predictor_exact_add_norm:
+            return add_rmsnorm_rounded(
+                hidden_states, residual, norm.weight, norm.variance_epsilon
+            )
+        else:
+            summed = residual + hidden_states
+            return norm(summed), summed
+
+    @staticmethod
+    def resolve_predictor_rope_store(
+        attention: Qwen3OmniMoeThinkerTextAttention, *, device: torch.device
+    ) -> bool:
+        """Whether the rope kernel can store K and V: a supported CUDA head size
+        does not imply CUDA dispatch when the backend override selects Torch."""
+        return (
+            device.type == "cuda"
+            and attention.compatible_with_fused_kv_buffer
+            and not attention.rotary_emb.use_fallback_kernel
+            and get_fused_op_backend()
+            not in (KernelBackend.TORCH, KernelBackend.TORCH_COMPILE)
+        )
+
+    def predictor_cached_self_attention(
+        self,
+        *,
+        layer_idx: int,
+        attn: Qwen3OmniMoeThinkerTextAttention,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        cache_slots: torch.Tensor,
+        batch_size: int,
+        cache_len: int,
+    ) -> torch.Tensor:
+        """Append the rows' tokens to the per-layer KV cache and attend over the
+        cached prefix; several tokens per row attend causally from an empty cache."""
+        _, seq_len, hidden_size = hidden_states.shape
+        if seq_len > 1 and cache_len != 0:
+            raise ValueError(
+                "several tokens per row attend causally only from an empty cache: "
+                f"got seq_len={seq_len} at cache_len={cache_len}"
+            )
+        else:
+            pass
+
+        flat_hidden = hidden_states.reshape(-1, hidden_size)
+        qkv, _ = attn.qkv_proj(flat_hidden)
+        q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
+        q, k = apply_qk_norm(
+            q=q,
+            k=k,
+            q_norm=attn.q_norm,
+            k_norm=attn.k_norm,
+            head_dim=attn.head_dim,
+            alt_stream=attn.alt_stream,
+        )
+        if self.predictor_rope_stores_kv:
+            store = FusedSetKVBufferArg(
+                value=v,
+                k_buffer=self.predictor_k_rows[layer_idx],
+                v_buffer=self.predictor_v_rows[layer_idx],
+                cache_loc=cache_slots,
+            )
+        else:
+            store = None
+        q, k = attn.rotary_emb(
+            positions.to(device=flat_hidden.device, dtype=torch.long),
+            q,
+            k,
+            fused_set_kv_buffer_arg=store,
+        )
+        end = cache_len + seq_len
+        if store is None:
+            self.predictor_k_cache[layer_idx, :batch_size, cache_len:end].copy_(
+                k.view(batch_size, seq_len, attn.num_kv_heads, attn.head_dim)
+            )
+            self.predictor_v_cache[layer_idx, :batch_size, cache_len:end].copy_(
+                v.view(batch_size, seq_len, attn.num_kv_heads, attn.head_dim)
+            )
+        else:
+            pass
+
+        q = q.reshape(batch_size, seq_len, attn.num_heads, attn.head_dim).transpose(
+            1, 2
+        )
+        cached_k = self.predictor_k_cache[layer_idx, :batch_size, :end].transpose(1, 2)
+        cached_v = self.predictor_v_cache[layer_idx, :batch_size, :end].transpose(1, 2)
+
+        # note (EdwardZhang1108): enable_gqa broadcasts KV heads in-kernel (#1145)
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            cached_k,
+            cached_v,
+            is_causal=seq_len > 1,
+            enable_gqa=attn.num_heads != attn.num_kv_heads,
+        )
+        attn_output = attn_output.transpose(1, 2).reshape(
+            batch_size * seq_len, attn.num_heads * attn.head_dim
+        )
+        attn_output, _ = attn.o_proj(attn_output)
+        return attn_output.reshape(batch_size, seq_len, hidden_size)
+
+    @torch.no_grad()
+    def code_predictor_forward(
+        self,
+        layer0_codes: torch.Tensor,
+        talker_hidden: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Generate residual RVQ codes in batch and mirror outputs into static buffers."""
+        result_codes, summed_embeddings = self.code_predictor_forward_incremental(
+            layer0_codes=layer0_codes,
+            talker_hidden=talker_hidden,
+        )
+        return result_codes, summed_embeddings
+
+    def precompile_kernels_after_loading(self) -> None:
+        """Compile the repetition penalty a request's first sample would compile, on the
+        float32 logits it receives."""
+        compile_sampler_functions(
+            SamplerCompileForms(
+                device=self.model.codec_embedding.weight.device,
+                vocab_size=self.config.text_config.vocab_size,
+                penalized_logits_dtype=torch.float32,
+            )
+        )
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
+        """Load weights from HuggingFace checkpoint."""
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        params_dict = self.cached_params_dict
+
+        # Stacked parameters mapping
+        stacked_params = [
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+
+        # MoE expert parameters mapping
+        expert_params = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.text_config.num_experts,
+        )
+
+        preprocess_weight = get_weight_preprocessor(
+            self.root_config, fp8_scale_inverted=True
+        )
+
+        for name, loaded_weight in weights:
+            # Support both monolithic (talker.xxx) and split (xxx) checkpoints
+            if name.startswith("talker."):
+                name = name[len("talker.") :]
+            elif "." in name and name.split(".")[0] in ("thinker", "code2wav"):
+                continue
+            else:
+                pass
+
+            # 1. Handle stacked parameters (qkv_proj, gate_up_proj)
+            handled = False
+            for param_name, weight_name, shard_id in stacked_params:
+                if weight_name in name and "mlp.experts" not in name:
+                    mapped = name.replace(weight_name, param_name)
+                    param = params_dict.get(mapped)
+                    if param is not None:
+                        loaded_weight = preprocess_weight(mapped, loaded_weight)
+                        param.weight_loader(param, loaded_weight, shard_id)
+                        handled = True
+                        break
+                    else:
+                        pass
+                else:
+                    pass
+            if handled:
+                continue
+            else:
+                pass
+
+            # 2. Handle MoE expert parameters
+            for param_name, weight_name, expert_id, shard_id in expert_params:
+                if weight_name in name:
+                    mapped = name.replace(weight_name, param_name)
+                    param = params_dict.get(mapped)
+                    if param is not None:
+                        loaded_weight = preprocess_weight(mapped, loaded_weight)
+                        param.weight_loader(
+                            param,
+                            loaded_weight,
+                            mapped,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                        )
+                        handled = True
+                        break
+                    else:
+                        pass
+                else:
+                    pass
+            if handled:
+                continue
+            else:
+                pass
+
+            # 3. Direct parameter loading
+            param = params_dict.get(name)
+            if param is not None:
+                loaded_weight = preprocess_weight(name, loaded_weight)
+                param.weight_loader(param, loaded_weight)
+            else:
+                pass

@@ -1,0 +1,113 @@
+default_stages: [pre-commit, pre-push, manual]
+
+exclude: \.(txt|ulaw)$
+
+repos:
+  - repo: https://github.com/PyCQA/autoflake
+    rev: v2.3.1
+    hooks:
+    -   id: autoflake
+        args: [--remove-all-unused-imports, --in-place]
+        exclude: (^\.claude/skills/|^Voxt/(?!backend/|Config/OmniDev\.xcconfig$|Voxt/VoxtOmniDev\.entitlements$|Voxt/Transcription/Omni))
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-symlinks
+      - id: destroyed-symlinks
+      # The Voxt/ import stays byte-identical to upstream; Voxt files added
+      # here (backend, Omni bridge, dev build settings) are checked normally.
+      - id: trailing-whitespace
+        exclude: ^Voxt/(?!backend/|Config/OmniDev\.xcconfig$|Voxt/VoxtOmniDev\.entitlements$|Voxt/Transcription/Omni)
+      - id: end-of-file-fixer
+        exclude: ^Voxt/(?!backend/|Config/OmniDev\.xcconfig$|Voxt/VoxtOmniDev\.entitlements$|Voxt/Transcription/Omni)
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+      - id: check-toml
+      - id: check-ast
+      - id: check-added-large-files
+      - id: check-merge-conflict
+      - id: check-shebang-scripts-are-executable
+        exclude: (?:^\.claude/skills/|^sglang_omni_router/tests/.*\.rs$|^Voxt/(?!backend/|Config/OmniDev\.xcconfig$|Voxt/VoxtOmniDev\.entitlements$|Voxt/Transcription/Omni))
+      - id: detect-private-key
+      - id: debug-statements
+      - id: no-commit-to-branch
+  - repo: https://github.com/PyCQA/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+        exclude: (^\.claude/skills/|^Voxt/(?!backend/|Config/OmniDev\.xcconfig$|Voxt/VoxtOmniDev\.entitlements$|Voxt/Transcription/Omni))
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.11.10
+    hooks:
+      - id: ruff
+        args: [--select=F401, --fixable=F401]
+        files: ^(benchmarks/|docs/|examples/)
+        exclude: \.ipynb$
+      - id: ruff-check
+  - repo: https://github.com/psf/black
+    rev: 24.10.0
+    hooks:
+      - id: black-jupyter
+        exclude: (^\.claude/skills/|^Voxt/(?!backend/|Config/OmniDev\.xcconfig$|Voxt/VoxtOmniDev\.entitlements$|Voxt/Transcription/Omni))
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v18.1.8
+    hooks:
+    - id: clang-format
+      types_or: [c++, cuda]
+      args: [--style=file, --verbose]
+  - repo: https://github.com/kynan/nbstripout
+    rev: 0.8.1
+    hooks:
+      - id: nbstripout
+        args:
+          - '--keep-output'
+          - '--extra-keys=metadata.kernelspec metadata.language_info.version'
+  - repo: local
+    hooks:
+      - id: sort-ci-permissions
+        name: sort CI_PERMISSIONS.json
+        entry: python3 .github/update_ci_permission.py --sort-only
+        language: system
+        files: ^\.github/CI_PERMISSIONS\.json$
+        pass_filenames: false
+      - id: rustfmt-sglang-omni-router
+        name: rustfmt sglang-omni-router
+        entry: bash -c 'cd sglang_omni_router && cargo fmt --all -- --check'
+        language: system
+        files: ^sglang_omni_router/.*\.rs$
+        pass_filenames: false
+      # Matches every new/existing file under sglang_omni/ and tests/, including
+      # models/*. Check only. Do not pass --fix: it renames within one file and
+      # misses cross-file callers, fixtures, and string references.
+      - id: leading-underscore-names
+        name: leading-underscore class, function, and attribute names
+        entry: python3 scripts/check_leading_underscore.py
+        language: system
+        types: [python]
+        files: ^(sglang_omni|tests)/
+        exclude: ^sglang_omni/vendor/
+      # Check only. Do not pass --fix: else: pass is a last resort, not the
+      # rewrite this hook should apply on commit.
+      - id: if-else-required
+        name: if statements must have else
+        entry: python3 scripts/check_if_else.py
+        language: system
+        types: [python]
+        files: ^sglang_omni/
+        exclude: ^sglang_omni/vendor/
+      # Check only. Each doc must have exactly one H1 and may not go deeper
+      # than H3 (#### is rejected). Headings inside fenced code blocks are
+      # ignored.
+      - id: doc-heading-structure
+        name: document heading structure (one H1, max H3)
+        entry: python3 scripts/check_doc_headings.py
+        language: system
+        types: [markdown]
+        files: ^docs/
+      - id: doc-style
+        name: document emoji style
+        entry: python3 scripts/check_doc_style.py
+        language: python
+        additional_dependencies: [emoji==2.15.0]
+        files: ^(docs/.*\.md$|scripts/check_doc_style\.py$|tests/unit_test/scripts/test_check_doc_style\.py$)
+        pass_filenames: false

@@ -1,0 +1,1505 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Stage factories for Qwen3-Omni pipelines.
+
+Each factory returns either:
+- A callable (compute_fn) for simple stages
+- An OmniScheduler for AR stages
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Literal, TypedDict
+
+import torch
+import torch.nn.functional as F
+from sglang.srt.server_args import ServerArgs
+
+from sglang_omni.models.qwen3_omni.bootstrap import create_thinker_scheduler
+from sglang_omni.models.qwen3_omni.components.audio_encoder import Qwen3OmniAudioEncoder
+from sglang_omni.models.qwen3_omni.components.image_encoder import (
+    ImageEncoderOutput,
+    Qwen3OmniImageEncoder,
+)
+from sglang_omni.models.qwen3_omni.components.preprocessor import Qwen3OmniPreprocessor
+from sglang_omni.models.qwen3_omni.components.streaming_detokenizer import (
+    StreamingDetokenizeScheduler,
+    create_streaming_detokenize_scheduler,
+)
+from sglang_omni.models.qwen3_omni.payload_types import Qwen3OmniPipelineState
+from sglang_omni.models.qwen3_omni.request_builders import (
+    EncoderRequestData,
+    apply_encoder_result,
+    build_encoder_request,
+)
+from sglang_omni.profiler.event_recorder import emit as _emit_event
+from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.generation_batch_policy import (
+    CudaGraphBackend,
+    build_default_prefill_cuda_graph_bs,
+    build_generation_batch_overrides,
+    operator_selected_prefill_backend,
+    validate_generation_batch_policy,
+)
+from sglang_omni.scheduling.sglang_backend import (
+    apply_encoder_mem_reserve,
+    build_sglang_server_args,
+)
+from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
+from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
+from sglang_omni.scheduling.stage_cache import StageOutputCache
+from sglang_omni.scheduling.threaded_simple_scheduler import ThreadedSimpleScheduler
+from sglang_omni.utils.gpu_memory import format_bytes_gib, get_process_gpu_memory_bytes
+from sglang_omni.utils.misc import avail_gpu_mem
+
+if TYPE_CHECKING:
+
+    from sglang_omni.models.qwen3_omni.talker_scheduler import QwenTalkerScheduler
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+else:
+    pass
+
+IMAGE_STAGE = "image_encoder"
+AUDIO_STAGE = "audio_encoder"
+THINKER_STAGE = "thinker"
+
+logger = logging.getLogger(__name__)
+
+# Image-encoder batching budget; the multiplier accounts for transient activations.
+QWEN3_IMAGE_ENCODER_BATCH_BUDGET_BYTES = 10 * 1024**3
+QWEN3_IMAGE_ENCODER_ACTIVATION_MULTIPLIER = 5
+
+# CPU LRU cap for repeated-media encoder outputs.
+QWEN3_ENCODER_CACHE_MAX_BYTES = 4 * 1024**3
+QWEN3_ENCODER_CACHE_MAX_ENTRIES = 64
+
+
+class ImageBatchMeta(TypedDict):
+    idx: int
+    payload: StagePayload
+    state: Qwen3OmniPipelineState
+    request: EncoderRequestData
+    image_rows: int
+    video_rows: int
+    image_token_total: int
+    video_token_total: int
+
+
+class AudioBatchItem(TypedDict):
+    idx: int
+    payload: StagePayload
+    state: Qwen3OmniPipelineState
+    request: EncoderRequestData
+    features: torch.Tensor
+    mask: torch.Tensor
+    lengths: torch.Tensor
+    count: int
+
+
+@dataclass(frozen=True)
+class ArMemoryContract:
+    mem_fraction_static_pinned: bool
+    effective_total_gpu_memory_fraction: float | None
+    applied_encoder_mem_reserve: float
+
+
+def apply_qwen_thinker_encoder_reserve(
+    server_args: ServerArgs | None,
+    *,
+    has_explicit_mem_fraction_static: bool,
+    encoder_mem_reserve: float,
+) -> bool:
+    if has_explicit_mem_fraction_static:
+        return False
+    else:
+        pass
+    apply_encoder_mem_reserve(server_args, encoder_mem_reserve)
+    return True
+
+
+def apply_colocated_ar_memory_contract(
+    overrides: dict[str, object],
+    *,
+    stage_name: str,
+    total_gpu_memory_fraction: float | None,
+    encoder_mem_reserve: float = 0.0,
+) -> ArMemoryContract:
+    """Derive or validate SGLang AR memory args for a colocated stage."""
+
+    if total_gpu_memory_fraction is None:
+        return ArMemoryContract(
+            mem_fraction_static_pinned=overrides.get("mem_fraction_static") is not None,
+            effective_total_gpu_memory_fraction=None,
+            applied_encoder_mem_reserve=0.0,
+        )
+    else:
+        pass
+
+    explicit_mem_fraction = overrides.get("mem_fraction_static")
+    if explicit_mem_fraction is not None:
+        if encoder_mem_reserve:
+            raise ValueError(
+                f"Stage {stage_name} cannot apply encoder_mem_reserve when "
+                "engine.mem_fraction_static is explicitly set."
+            )
+        else:
+            pass
+        if abs(float(explicit_mem_fraction) - total_gpu_memory_fraction) > 1e-3:
+            raise ValueError(
+                f"Stage {stage_name} sets conflicting colocated memory "
+                "contracts: runtime.resources.total_gpu_memory_fraction="
+                f"{total_gpu_memory_fraction:.3f} and "
+                "engine.mem_fraction_static="
+                f"{float(explicit_mem_fraction):.3f}. Use one value or make "
+                "the explicit SGLang override match the stage total budget."
+            )
+        else:
+            pass
+        return ArMemoryContract(
+            mem_fraction_static_pinned=True,
+            effective_total_gpu_memory_fraction=total_gpu_memory_fraction,
+            applied_encoder_mem_reserve=0.0,
+        )
+    else:
+        pass
+
+    effective_total_gpu_memory_fraction = apply_colocated_encoder_mem_reserve(
+        total_gpu_memory_fraction,
+        encoder_mem_reserve,
+    )
+    overrides["mem_fraction_static"] = effective_total_gpu_memory_fraction
+    applied_encoder_mem_reserve = (
+        encoder_mem_reserve
+        if effective_total_gpu_memory_fraction != total_gpu_memory_fraction
+        else 0.0
+    )
+    return ArMemoryContract(
+        mem_fraction_static_pinned=True,
+        effective_total_gpu_memory_fraction=effective_total_gpu_memory_fraction,
+        applied_encoder_mem_reserve=applied_encoder_mem_reserve,
+    )
+
+
+def apply_colocated_encoder_mem_reserve(
+    total_gpu_memory_fraction: float,
+    encoder_mem_reserve: float,
+) -> float:
+    if not 0.0 <= encoder_mem_reserve < 1.0:
+        raise ValueError("encoder_mem_reserve must be in [0, 1)")
+    else:
+        pass
+    if encoder_mem_reserve == 0:
+        return total_gpu_memory_fraction
+    else:
+        pass
+
+    effective_total_gpu_memory_fraction = (
+        total_gpu_memory_fraction - encoder_mem_reserve
+    )
+    if effective_total_gpu_memory_fraction < 0.1:
+        raise ValueError(
+            f"colocated total_gpu_memory_fraction {total_gpu_memory_fraction:.3f} "
+            f"minus encoder_mem_reserve {encoder_mem_reserve:.3f} = "
+            f"{effective_total_gpu_memory_fraction:.3f} is below the safe floor "
+            "0.1; lower encoder_mem_reserve or increase the thinker stage budget."
+        )
+    else:
+        pass
+    return round(effective_total_gpu_memory_fraction, 3)
+
+
+def load_state(payload: StagePayload) -> Qwen3OmniPipelineState:
+    return Qwen3OmniPipelineState.from_dict(payload.data)
+
+
+def store_state(payload: StagePayload, state: Qwen3OmniPipelineState) -> StagePayload:
+    payload.data = state.to_dict()
+    return payload
+
+
+def run_single_encoder_payload(
+    payload: StagePayload,
+    *,
+    stage_name: str,
+    model: Qwen3OmniImageEncoder | Qwen3OmniAudioEncoder | None,
+    cache: StageOutputCache | None = None,
+) -> StagePayload:
+    state = load_state(payload)
+    request = build_encoder_request(state, stage_name=stage_name)
+    if request.skip_result is not None:
+        result = request.skip_result
+    else:
+        result = lookup_cached_encoder_output(
+            request=request,
+            request_id=payload.request_id,
+            stage_name=stage_name,
+            cache=cache,
+        )
+        if result is None:
+            with torch.no_grad():
+                result = model(**request.model_inputs)
+            store_cached_encoder_output(
+                request=request,
+                request_id=payload.request_id,
+                stage_name=stage_name,
+                cache=cache,
+                result=result,
+            )
+        else:
+            pass
+    apply_encoder_result(state, stage_name=stage_name, result=result)
+    return store_state(payload, state)
+
+
+def image_request_is_batchable(request: EncoderRequestData) -> bool:
+    if request.skip_result is not None:
+        return False
+    else:
+        pass
+    input_dict = request.model_inputs
+    for key in (
+        "pixel_values",
+        "image_grid_thw",
+        "pixel_values_videos",
+        "video_grid_thw",
+    ):
+        value = input_dict.get(key)
+        if value is not None and not isinstance(value, torch.Tensor):
+            return False
+        else:
+            pass
+    return True
+
+
+def split_visual_features(
+    tensor: torch.Tensor | None,
+    *,
+    start: int,
+    end: int,
+) -> torch.Tensor | None:
+    if tensor is None:
+        return None
+    else:
+        pass
+    return tensor[start:end]
+
+
+def split_visual_multiscale(
+    tensors: list[torch.Tensor] | None,
+    *,
+    start: int,
+    end: int,
+) -> list[torch.Tensor] | None:
+    if tensors is None:
+        return None
+    else:
+        pass
+    return [tensor[start:end] for tensor in tensors]
+
+
+def create_image_encoder_request_cost_fn(
+    model: Qwen3OmniImageEncoder,
+) -> Callable[[StagePayload], int]:
+    merge = int(model.spatial_merge_size) ** 2
+    hidden = int(model.out_hidden_size)
+    output_layers = 1 + int(model.deepstack_layers)
+    dtype_bytes = int(model.visual_dtype_bytes)
+
+    def _cost(payload: StagePayload) -> int:
+        state = load_state(payload)
+        request = build_encoder_request(state, stage_name=IMAGE_STAGE)
+        if request.skip_result is not None:
+            return 0
+        else:
+            pass
+        model_inputs = request.model_inputs
+        raw_bytes = tensor_bytes(model_inputs.get("pixel_values"))
+        raw_bytes += tensor_bytes(model_inputs.get("pixel_values_videos"))
+        visual_tokens = grid_visual_tokens(model_inputs.get("image_grid_thw"), merge)
+        visual_tokens += grid_visual_tokens(
+            model_inputs.get("video_grid_thw"),
+            merge,
+        )
+        output_bytes = visual_tokens * hidden * dtype_bytes * output_layers
+        return (raw_bytes + output_bytes) * QWEN3_IMAGE_ENCODER_ACTIVATION_MULTIPLIER
+
+    return _cost
+
+
+def tensor_bytes(value: object) -> int:
+    if not isinstance(value, torch.Tensor):
+        return 0
+    else:
+        pass
+    return int(value.numel() * value.element_size())
+
+
+def nested_tensor_bytes(value: object) -> int:
+    if isinstance(value, torch.Tensor):
+        return tensor_bytes(value)
+    else:
+        pass
+    if isinstance(value, dict):
+        return sum(nested_tensor_bytes(item) for item in value.values())
+    else:
+        pass
+    if isinstance(value, (list, tuple)):
+        return sum(nested_tensor_bytes(item) for item in value)
+    else:
+        pass
+    return 0
+
+
+def encoder_batch_wait_ms() -> int:
+    raw = os.getenv("SGLANG_OMNI_ENCODER_BATCH_WAIT_MS", "")
+    if not raw:
+        return 0
+    else:
+        pass
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Ignoring non-integer SGLANG_OMNI_ENCODER_BATCH_WAIT_MS=%r; using 0",
+            raw,
+        )
+        return 0
+    if value < 0:
+        logger.warning(
+            "Ignoring negative SGLANG_OMNI_ENCODER_BATCH_WAIT_MS=%d; using 0",
+            value,
+        )
+        return 0
+    else:
+        pass
+    return value
+
+
+def encoder_cache_trace_enabled() -> bool:
+    value = os.getenv("SGLANG_OMNI_TRACE_ENCODER_CACHE", "")
+    return value.lower() not in ("", "0", "false", "no")
+
+
+def short_cache_key(cache_key: str | None) -> str:
+    if not cache_key:
+        return "-"
+    else:
+        pass
+    if len(cache_key) <= 32:
+        return cache_key
+    else:
+        pass
+    return f"{cache_key[:16]}...{cache_key[-8:]}"
+
+
+def trace_encoder_cache(
+    stage_name: str,
+    action: str,
+    *,
+    request_id: str,
+    cache_key: str | None,
+    input_bytes: int | None = None,
+    output_bytes: int | None = None,
+    detail: str | None = None,
+) -> None:
+    if not encoder_cache_trace_enabled():
+        return
+    else:
+        pass
+    parts = [
+        f"stage={stage_name}",
+        f"action={action}",
+        f"req={request_id}",
+        f"key={short_cache_key(cache_key)}",
+    ]
+    if input_bytes is not None:
+        parts.append(f"input_bytes={input_bytes}")
+    else:
+        pass
+    if output_bytes is not None:
+        parts.append(f"output_bytes={output_bytes}")
+    else:
+        pass
+    if detail:
+        parts.append(detail)
+    else:
+        pass
+    logger.info("encoder_cache %s", " ".join(parts))
+
+
+def lookup_cached_encoder_output(
+    *,
+    request: EncoderRequestData,
+    request_id: str,
+    stage_name: str,
+    cache: StageOutputCache | None,
+) -> ImageEncoderOutput | dict[str, torch.Tensor] | None:
+    if cache is None or request.cache_key is None:
+        return None
+    else:
+        pass
+    cached = cache.get(request.cache_key)
+    if cached is None:
+        trace_encoder_cache(
+            stage_name,
+            "miss",
+            request_id=request_id,
+            cache_key=request.cache_key,
+            input_bytes=nested_tensor_bytes(request.model_inputs),
+        )
+        return None
+    else:
+        pass
+    trace_encoder_cache(
+        stage_name,
+        "hit",
+        request_id=request_id,
+        cache_key=request.cache_key,
+        input_bytes=nested_tensor_bytes(request.model_inputs),
+        output_bytes=nested_tensor_bytes(cached),
+    )
+    return cached
+
+
+def store_cached_encoder_output(
+    *,
+    request: EncoderRequestData,
+    request_id: str,
+    stage_name: str,
+    cache: StageOutputCache | None,
+    result: ImageEncoderOutput | dict[str, torch.Tensor],
+) -> None:
+    if cache is None or request.cache_key is None:
+        return
+    else:
+        pass
+    cache.put(request.cache_key, result)
+    trace_encoder_cache(
+        stage_name,
+        "store",
+        request_id=request_id,
+        cache_key=request.cache_key,
+        input_bytes=nested_tensor_bytes(request.model_inputs),
+        output_bytes=nested_tensor_bytes(result),
+    )
+
+
+def grid_visual_tokens(grid: object, merge: int) -> int:
+    if not isinstance(grid, torch.Tensor) or grid.numel() == 0:
+        return 0
+    else:
+        pass
+    return int((grid.to(dtype=torch.long).prod(dim=-1) // merge).sum().item())
+
+
+def batch_image_encoder_payloads(
+    payloads: list[StagePayload],
+    *,
+    model: Qwen3OmniImageEncoder | None,
+    cache: StageOutputCache | None = None,
+) -> list[StagePayload]:
+    results: list[StagePayload | None] = [None] * len(payloads)
+    active: list[
+        tuple[int, StagePayload, Qwen3OmniPipelineState, EncoderRequestData]
+    ] = []
+    duplicate_waiters: dict[
+        str, list[tuple[int, StagePayload, Qwen3OmniPipelineState]]
+    ] = {}
+    active_cache_keys: set[str] = set()
+    active_cache_leaders: dict[str, str] = {}
+
+    for idx, payload in enumerate(payloads):
+        state = load_state(payload)
+        request = build_encoder_request(state, stage_name=IMAGE_STAGE)
+        if request.skip_result is not None:
+            results[idx] = run_single_encoder_payload(
+                payload,
+                stage_name=IMAGE_STAGE,
+                model=model,
+                cache=cache,
+            )
+            continue
+        else:
+            pass
+
+        cached = lookup_cached_encoder_output(
+            request=request,
+            request_id=payload.request_id,
+            stage_name=IMAGE_STAGE,
+            cache=cache,
+        )
+        if cached is not None:
+            apply_encoder_result(state, stage_name=IMAGE_STAGE, result=cached)
+            results[idx] = store_state(payload, state)
+            continue
+        else:
+            pass
+
+        if not image_request_is_batchable(request):
+            results[idx] = run_single_encoder_payload(
+                payload,
+                stage_name=IMAGE_STAGE,
+                model=model,
+                cache=cache,
+            )
+            continue
+        else:
+            pass
+
+        cache_key = request.cache_key
+        if cache_key is not None and cache_key in active_cache_keys:
+            duplicate_waiters.setdefault(cache_key, []).append((idx, payload, state))
+            trace_encoder_cache(
+                IMAGE_STAGE,
+                "dedup_same_batch",
+                request_id=payload.request_id,
+                cache_key=cache_key,
+                input_bytes=nested_tensor_bytes(request.model_inputs),
+                detail=f"leader={active_cache_leaders[cache_key]}",
+            )
+            continue
+        else:
+            pass
+
+        active.append((idx, payload, state, request))
+        if cache_key is not None:
+            active_cache_keys.add(cache_key)
+            active_cache_leaders[cache_key] = payload.request_id
+        else:
+            pass
+
+    if not active:
+        return [result for result in results if result is not None]
+    else:
+        pass
+
+    image_pixels: list[torch.Tensor] = []
+    image_grids: list[torch.Tensor] = []
+    video_pixels: list[torch.Tensor] = []
+    video_grids: list[torch.Tensor] = []
+    metas: list[ImageBatchMeta] = []
+    merge = model.spatial_merge_size**2
+
+    for idx, payload, state, request in active:
+        input_dict = request.model_inputs
+        image_grid = input_dict.get("image_grid_thw")
+        video_grid = input_dict.get("video_grid_thw")
+        image_rows = (
+            int(image_grid.shape[0]) if isinstance(image_grid, torch.Tensor) else 0
+        )
+        video_rows = (
+            int(video_grid.shape[0]) if isinstance(video_grid, torch.Tensor) else 0
+        )
+        image_token_counts = (
+            (image_grid.prod(-1) // merge).to(dtype=torch.long)
+            if isinstance(image_grid, torch.Tensor)
+            else None
+        )
+        video_token_counts = (
+            (video_grid.prod(-1) // merge).to(dtype=torch.long)
+            if isinstance(video_grid, torch.Tensor)
+            else None
+        )
+        image_token_total = (
+            int(image_token_counts.sum().item())
+            if isinstance(image_token_counts, torch.Tensor)
+            else 0
+        )
+        video_token_total = (
+            int(video_token_counts.sum().item())
+            if isinstance(video_token_counts, torch.Tensor)
+            else 0
+        )
+        if isinstance(input_dict.get("pixel_values"), torch.Tensor):
+            image_pixels.append(input_dict["pixel_values"])
+            image_grids.append(image_grid)
+        else:
+            pass
+        if isinstance(input_dict.get("pixel_values_videos"), torch.Tensor):
+            video_pixels.append(input_dict["pixel_values_videos"])
+            video_grids.append(video_grid)
+        else:
+            pass
+        metas.append(
+            {
+                "idx": idx,
+                "payload": payload,
+                "state": state,
+                "request": request,
+                "image_rows": image_rows,
+                "video_rows": video_rows,
+                "image_token_total": image_token_total,
+                "video_token_total": video_token_total,
+            }
+        )
+
+    batched_inputs: dict[str, torch.Tensor] = {}
+    if image_pixels:
+        batched_inputs["pixel_values"] = torch.cat(image_pixels, dim=0)
+        batched_inputs["image_grid_thw"] = torch.cat(image_grids, dim=0)
+    else:
+        pass
+    if video_pixels:
+        batched_inputs["pixel_values_videos"] = torch.cat(video_pixels, dim=0)
+        batched_inputs["video_grid_thw"] = torch.cat(video_grids, dim=0)
+    else:
+        pass
+
+    with torch.no_grad():
+        combined = model(**batched_inputs)
+
+    image_grid_all = combined.get("image_grid_thw")
+    image_counts_all = combined.get("image_token_counts")
+    image_embeds_all = combined.get("image_embeds")
+    image_multiscale_all = combined.get("deepstack_visual_embeds_image")
+    video_grid_all = combined.get("video_grid_thw")
+    video_counts_all = combined.get("video_token_counts")
+    video_embeds_all = combined.get("video_embeds")
+    video_multiscale_all = combined.get("deepstack_visual_embeds_video")
+
+    image_row_cursor = 0
+    image_token_cursor = 0
+    video_row_cursor = 0
+    video_token_cursor = 0
+    computed_by_cache_key: dict[str, ImageEncoderOutput] = {}
+    for meta in metas:
+        stage_result: ImageEncoderOutput = {}
+        if meta["image_rows"] > 0:
+            row_end = image_row_cursor + meta["image_rows"]
+            token_end = image_token_cursor + meta["image_token_total"]
+            stage_result["image_embeds"] = split_visual_features(
+                image_embeds_all, start=image_token_cursor, end=token_end
+            )
+            stage_result["image_grid_thw"] = image_grid_all[image_row_cursor:row_end]
+            stage_result["image_token_counts"] = image_counts_all[
+                image_row_cursor:row_end
+            ]
+            stage_result["deepstack_visual_embeds_image"] = split_visual_multiscale(
+                image_multiscale_all,
+                start=image_token_cursor,
+                end=token_end,
+            )
+            image_row_cursor = row_end
+            image_token_cursor = token_end
+        else:
+            pass
+        if meta["video_rows"] > 0:
+            row_end = video_row_cursor + meta["video_rows"]
+            token_end = video_token_cursor + meta["video_token_total"]
+            stage_result["video_embeds"] = split_visual_features(
+                video_embeds_all, start=video_token_cursor, end=token_end
+            )
+            stage_result["video_grid_thw"] = video_grid_all[video_row_cursor:row_end]
+            stage_result["video_token_counts"] = video_counts_all[
+                video_row_cursor:row_end
+            ]
+            stage_result["deepstack_visual_embeds_video"] = split_visual_multiscale(
+                video_multiscale_all,
+                start=video_token_cursor,
+                end=token_end,
+            )
+            video_row_cursor = row_end
+            video_token_cursor = token_end
+        else:
+            pass
+        request = meta["request"]
+        store_cached_encoder_output(
+            request=request,
+            request_id=meta["payload"].request_id,
+            stage_name=IMAGE_STAGE,
+            cache=cache,
+            result=stage_result,
+        )
+        if request.cache_key is not None:
+            computed_by_cache_key[request.cache_key] = stage_result
+        else:
+            pass
+        apply_encoder_result(meta["state"], stage_name=IMAGE_STAGE, result=stage_result)
+        results[meta["idx"]] = store_state(meta["payload"], meta["state"])
+
+    for cache_key, waiters in duplicate_waiters.items():
+        cached_stage_result = computed_by_cache_key.get(cache_key)
+        if cached_stage_result is None:
+            continue
+        else:
+            pass
+        for idx, payload, state in waiters:
+            apply_encoder_result(
+                state, stage_name=IMAGE_STAGE, result=cached_stage_result
+            )
+            results[idx] = store_state(payload, state)
+
+    return [result for result in results if result is not None]
+
+
+def audio_request_is_batchable(request: EncoderRequestData) -> bool:
+    if request.skip_result is not None:
+        return False
+    else:
+        pass
+    input_dict = request.model_inputs
+    features = input_dict.get("input_features")
+    if not isinstance(features, torch.Tensor):
+        return False
+    else:
+        pass
+    lengths = input_dict.get("audio_feature_lengths")
+    mask = input_dict.get("feature_attention_mask")
+    return (lengths is None or isinstance(lengths, torch.Tensor)) and (
+        mask is None or isinstance(mask, torch.Tensor)
+    )
+
+
+def normalize_audio_request_tensors(
+    request: EncoderRequestData,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    input_dict = request.model_inputs
+    features = input_dict["input_features"]
+    if features.ndim == 2:
+        features = features.unsqueeze(0)
+    else:
+        pass
+
+    lengths = input_dict.get("audio_feature_lengths")
+    mask = input_dict.get("feature_attention_mask")
+    if isinstance(lengths, torch.Tensor):
+        lengths = lengths.to(dtype=torch.long).view(-1)
+    elif isinstance(mask, torch.Tensor):
+        lengths = mask.to(dtype=torch.long).sum(dim=1).view(-1)
+    else:
+        raise ValueError("audio_feature_lengths or feature_attention_mask is required")
+
+    time_dim = features.shape[-1]
+    if isinstance(mask, torch.Tensor):
+        if mask.ndim == 1:
+            mask = mask.unsqueeze(0)
+        else:
+            pass
+        mask = mask.to(dtype=torch.bool)
+    else:
+        steps = torch.arange(time_dim, dtype=torch.long).unsqueeze(0)
+        mask = steps < lengths.unsqueeze(1)
+
+    return features, mask, lengths
+
+
+def pad_audio_features(features: torch.Tensor, target_time: int) -> torch.Tensor:
+    pad = target_time - int(features.shape[-1])
+    if pad <= 0:
+        return features
+    else:
+        pass
+    return F.pad(features, (0, pad))
+
+
+def pad_audio_mask(mask: torch.Tensor, target_time: int) -> torch.Tensor:
+    pad = target_time - int(mask.shape[-1])
+    if pad <= 0:
+        return mask
+    else:
+        pass
+    return F.pad(mask, (0, pad), value=False)
+
+
+def batch_audio_encoder_payloads(
+    payloads: list[StagePayload],
+    *,
+    model: Qwen3OmniAudioEncoder | None,
+    cache: StageOutputCache | None = None,
+) -> list[StagePayload]:
+    results: list[StagePayload | None] = [None] * len(payloads)
+    active: list[
+        tuple[int, StagePayload, Qwen3OmniPipelineState, EncoderRequestData]
+    ] = []
+    duplicate_waiters: dict[
+        str, list[tuple[int, StagePayload, Qwen3OmniPipelineState]]
+    ] = {}
+    active_cache_keys: set[str] = set()
+    active_cache_leaders: dict[str, str] = {}
+
+    for idx, payload in enumerate(payloads):
+        state = load_state(payload)
+        request = build_encoder_request(state, stage_name=AUDIO_STAGE)
+        if request.skip_result is not None:
+            results[idx] = run_single_encoder_payload(
+                payload,
+                stage_name=AUDIO_STAGE,
+                model=model,
+                cache=cache,
+            )
+            continue
+        else:
+            pass
+
+        cached = lookup_cached_encoder_output(
+            request=request,
+            request_id=payload.request_id,
+            stage_name=AUDIO_STAGE,
+            cache=cache,
+        )
+        if cached is not None:
+            apply_encoder_result(state, stage_name=AUDIO_STAGE, result=cached)
+            results[idx] = store_state(payload, state)
+            continue
+        else:
+            pass
+
+        if not audio_request_is_batchable(request):
+            results[idx] = run_single_encoder_payload(
+                payload,
+                stage_name=AUDIO_STAGE,
+                model=model,
+                cache=cache,
+            )
+            continue
+        else:
+            pass
+
+        cache_key = request.cache_key
+        if cache_key is not None and cache_key in active_cache_keys:
+            duplicate_waiters.setdefault(cache_key, []).append((idx, payload, state))
+            trace_encoder_cache(
+                AUDIO_STAGE,
+                "dedup_same_batch",
+                request_id=payload.request_id,
+                cache_key=cache_key,
+                input_bytes=nested_tensor_bytes(request.model_inputs),
+                detail=f"leader={active_cache_leaders[cache_key]}",
+            )
+            continue
+        else:
+            pass
+
+        active.append((idx, payload, state, request))
+        if cache_key is not None:
+            active_cache_keys.add(cache_key)
+            active_cache_leaders[cache_key] = payload.request_id
+        else:
+            pass
+
+    if not active:
+        return [result for result in results if result is not None]
+    else:
+        pass
+
+    normalized: list[AudioBatchItem] = []
+    max_time = 0
+    for idx, payload, state, request in active:
+        features, mask, lengths = normalize_audio_request_tensors(request)
+        max_time = max(max_time, int(features.shape[-1]))
+        normalized.append(
+            {
+                "idx": idx,
+                "payload": payload,
+                "state": state,
+                "features": features,
+                "mask": mask,
+                "lengths": lengths,
+                "count": int(lengths.shape[0]),
+                "request": request,
+            }
+        )
+
+    batched_features = torch.cat(
+        [pad_audio_features(item["features"], max_time) for item in normalized], dim=0
+    )
+    batched_mask = torch.cat(
+        [pad_audio_mask(item["mask"], max_time) for item in normalized], dim=0
+    )
+    batched_lengths = torch.cat([item["lengths"] for item in normalized], dim=0)
+
+    with torch.no_grad():
+        combined = model(
+            input_features=batched_features,
+            feature_attention_mask=batched_mask,
+            audio_feature_lengths=batched_lengths,
+        )
+
+    output_lengths = combined["audio_output_lengths"]
+    embeds = combined["audio_embeds"]
+    row_cursor = 0
+    token_cursor = 0
+    computed_by_cache_key: dict[str, dict[str, torch.Tensor]] = {}
+    for item in normalized:
+        row_end = row_cursor + item["count"]
+        req_output_lengths = output_lengths[row_cursor:row_end]
+        token_end = token_cursor + int(req_output_lengths.sum().item())
+        stage_result = {
+            "audio_embeds": embeds[token_cursor:token_end],
+            "audio_feature_lengths": combined["audio_feature_lengths"][
+                row_cursor:row_end
+            ],
+            "audio_output_lengths": req_output_lengths,
+        }
+        store_cached_encoder_output(
+            request=item["request"],
+            request_id=item["payload"].request_id,
+            stage_name=AUDIO_STAGE,
+            cache=cache,
+            result=stage_result,
+        )
+        if item["request"].cache_key is not None:
+            computed_by_cache_key[item["request"].cache_key] = stage_result
+        else:
+            pass
+        apply_encoder_result(item["state"], stage_name=AUDIO_STAGE, result=stage_result)
+        results[item["idx"]] = store_state(item["payload"], item["state"])
+        row_cursor = row_end
+        token_cursor = token_end
+
+    for cache_key, waiters in duplicate_waiters.items():
+        stage_result = computed_by_cache_key.get(cache_key)
+        if stage_result is None:
+            continue
+        else:
+            pass
+        for idx, payload, state in waiters:
+            apply_encoder_result(state, stage_name=AUDIO_STAGE, result=stage_result)
+            results[idx] = store_state(payload, state)
+
+    return [result for result in results if result is not None]
+
+
+# ---------------------------------------------------------------------------
+# Simple stages — return SimpleScheduler
+# ---------------------------------------------------------------------------
+
+
+def create_preprocessing_executor(
+    model_path: str,
+    *,
+    max_seq_len: int | None = None,
+    max_concurrency: int = 1,
+    video_fps: float | None = None,
+    video_max_frames: int | None = None,
+    video_min_pixels: int | None = None,
+    video_max_pixels: int | None = None,
+    video_total_pixels: int | None = None,
+) -> (
+    SimpleScheduler[StagePayload, StagePayload]
+    | ThreadedSimpleScheduler[StagePayload, StagePayload]
+):
+    preprocessor = Qwen3OmniPreprocessor(
+        model_path=model_path,
+        max_seq_len=max_seq_len,
+        video_fps=video_fps,
+        video_max_frames=video_max_frames,
+        video_min_pixels=video_min_pixels,
+        video_max_pixels=video_max_pixels,
+        video_total_pixels=video_total_pixels,
+    )
+
+    async def _preprocess(payload: StagePayload) -> StagePayload:
+        return await preprocessor(payload)
+
+    # Note (wenyao): threaded dispatch deepens thinker batches, and greedy bf16 MoE
+    # answers shift with batch composition (Video-MME CI flipped); serial by default.
+    if max_concurrency <= 1:
+        from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
+
+        return SimpleScheduler[StagePayload, StagePayload](_preprocess)
+    else:
+        pass
+
+    from sglang_omni.scheduling.threaded_simple_scheduler import ThreadedSimpleScheduler
+
+    return ThreadedSimpleScheduler[StagePayload, StagePayload](
+        _preprocess, max_concurrency=max_concurrency
+    )
+
+
+def create_aggregate_executor(
+    *,
+    device: str | None = None,
+    gpu_id: int | None = None,
+) -> SimpleScheduler[StagePayload, StagePayload]:
+    # note (lennox): identity stage placed on GPU for colocation only;
+    # it does not touch the device.
+    del device, gpu_id
+    from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
+
+    def _identity(payload: StagePayload) -> StagePayload:
+        return payload
+
+    return SimpleScheduler(_identity)
+
+
+def create_image_encoder_executor(
+    model_path: str,
+    *,
+    device: str | None = None,
+    gpu_id: int | None = None,
+    dtype: str | None = None,
+) -> SimpleScheduler[StagePayload, StagePayload]:
+    from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
+    from sglang_omni.utils.device import resolve_concrete_device
+
+    device = str(resolve_concrete_device(device, gpu_id))
+    model = Qwen3OmniImageEncoder(model_path=model_path, device=device, dtype=dtype)
+    cache = StageOutputCache(
+        max_size=QWEN3_ENCODER_CACHE_MAX_ENTRIES,
+        max_bytes=QWEN3_ENCODER_CACHE_MAX_BYTES,
+        cache_device="cpu",
+    )
+
+    def _encode(payload: StagePayload) -> StagePayload:
+        _emit_event(
+            request_id=payload.request_id,
+            stage=None,
+            event_name="encoder_start",
+            metadata={"modality": "image", "batch_size": 1},
+        )
+        try:
+            return run_single_encoder_payload(
+                payload,
+                stage_name=IMAGE_STAGE,
+                model=model,
+                cache=cache,
+            )
+        finally:
+            _emit_event(
+                request_id=payload.request_id,
+                stage=None,
+                event_name="encoder_end",
+                metadata={"modality": "image", "batch_size": 1},
+            )
+
+    def _encode_batch(payloads: list[StagePayload]) -> list[StagePayload]:
+        for p in payloads:
+            _emit_event(
+                request_id=p.request_id,
+                stage=None,
+                event_name="encoder_start",
+                metadata={"modality": "image", "batch_size": len(payloads)},
+            )
+        try:
+            return batch_image_encoder_payloads(
+                payloads,
+                model=model,
+                cache=cache,
+            )
+        finally:
+            for p in payloads:
+                _emit_event(
+                    request_id=p.request_id,
+                    stage=None,
+                    event_name="encoder_end",
+                    metadata={"modality": "image", "batch_size": len(payloads)},
+                )
+
+    # Preserve the calibrated image-encoder batching shape while allowing
+    # deployments to opt into a batch wait through the shared encoder knob.
+    return SimpleScheduler(
+        _encode,
+        batch_compute_fn=_encode_batch,
+        max_batch_size=32,
+        max_batch_wait_ms=encoder_batch_wait_ms(),
+        request_cost_fn=create_image_encoder_request_cost_fn(model),
+        max_batch_cost=QWEN3_IMAGE_ENCODER_BATCH_BUDGET_BYTES,
+    )
+
+
+def create_audio_encoder_executor(
+    model_path: str,
+    *,
+    device: str | None = None,
+    gpu_id: int | None = None,
+    dtype: str | None = None,
+    enable_layer_cuda_graph: bool = False,
+) -> SimpleScheduler[StagePayload, StagePayload]:
+    from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
+    from sglang_omni.utils.device import resolve_concrete_device
+
+    device = str(resolve_concrete_device(device, gpu_id))
+    model = Qwen3OmniAudioEncoder(
+        model_path=model_path,
+        device=device,
+        dtype=dtype,
+        enable_layer_cuda_graph=enable_layer_cuda_graph,
+    )
+    cache = StageOutputCache(
+        max_size=QWEN3_ENCODER_CACHE_MAX_ENTRIES,
+        max_bytes=QWEN3_ENCODER_CACHE_MAX_BYTES,
+        cache_device="cpu",
+    )
+
+    def _encode(payload: StagePayload) -> StagePayload:
+        _emit_event(
+            request_id=payload.request_id,
+            stage=None,
+            event_name="encoder_start",
+            metadata={"modality": "audio", "batch_size": 1},
+        )
+        try:
+            return run_single_encoder_payload(
+                payload,
+                stage_name=AUDIO_STAGE,
+                model=model,
+                cache=cache,
+            )
+        finally:
+            _emit_event(
+                request_id=payload.request_id,
+                stage=None,
+                event_name="encoder_end",
+                metadata={"modality": "audio", "batch_size": 1},
+            )
+
+    def _encode_batch(payloads: list[StagePayload]) -> list[StagePayload]:
+        for p in payloads:
+            _emit_event(
+                request_id=p.request_id,
+                stage=None,
+                event_name="encoder_start",
+                metadata={"modality": "audio", "batch_size": len(payloads)},
+            )
+        try:
+            return batch_audio_encoder_payloads(
+                payloads,
+                model=model,
+                cache=cache,
+            )
+        finally:
+            for p in payloads:
+                _emit_event(
+                    request_id=p.request_id,
+                    stage=None,
+                    event_name="encoder_end",
+                    metadata={"modality": "audio", "batch_size": len(payloads)},
+                )
+
+    return SimpleScheduler(
+        _encode,
+        batch_compute_fn=_encode_batch,
+        max_batch_size=32,
+        max_batch_wait_ms=encoder_batch_wait_ms(),
+        batch_wait_when_idle=False,
+    )
+
+
+def create_decode_executor(model_path: str) -> StreamingDetokenizeScheduler:
+    return create_streaming_detokenize_scheduler(model_path)
+
+
+# ---------------------------------------------------------------------------
+# AR stages — return OmniScheduler
+# ---------------------------------------------------------------------------
+
+
+def create_sglang_thinker_executor_from_config(
+    model_path: str,
+    *,
+    device: str | None = None,
+    gpu_id: int | None = None,
+    tp_rank: int = 0,
+    tp_size: int = 1,
+    nccl_port: int | None = None,
+    max_seq_len: int | None = None,
+    server_args_overrides: Mapping[str, object] | None = None,
+    encoder_mem_reserve: float = 0.05,
+    speech_enabled: bool = False,
+    total_gpu_memory_fraction: float | None = None,
+    enable_async_decode: bool = True,
+    async_decode_min_batch_size: int = 1,
+    prefill_coalesce_requests: int = 0,
+    prefill_coalesce_wait_ms: float = 60.0,
+    prefill_coalesce_when_idle: bool = False,
+    execution_mode: Literal["request", "session"] = "request",
+    continuation_aware_admission: bool = True,
+) -> "OmniScheduler[SGLangARRequestData]":
+    """Returns OmniScheduler for thinker."""
+    from sglang_omni.scheduling.sglang_backend import pin_resolved_device_type
+    from sglang_omni.utils.device import resolve_concrete_device
+
+    concrete_device = resolve_concrete_device(device, gpu_id)
+    gpu_id = concrete_device.index or 0
+    # note (luojiaxuan):
+    # The thinker runs prefill XOR decode per scheduler step, so under
+    # concurrent streaming a large fraction of steps are prefill-only while
+    # in-flight decodes stall (measured on Qwen3-Omni-30B TP=2, 32 streams:
+    # ~98% of prefill steps had decode-ready reqs in running_batch passed over,
+    # ~18/step). Mixed-chunk folds those running decodes into the chunk-prefill
+    # (extend) step, restoring the decode duty cycle: +14% throughput and ~6%
+    # lower computation-aware latency at quality parity, with no low-concurrency
+    # regression and robustness to chunked_prefill_size (#760). Defaults here so
+    # the streaming-SST thinker path benefits out of the box; either key can be
+    # overridden via server_args_overrides (set enable_mixed_chunk=False to opt
+    # out). Note: mixed-chunk only engages when chunked_prefill_size > 0.
+    from sglang_omni.platforms import current_platform
+
+    if current_platform.is_cuda():
+        prefill_graph_backend = CudaGraphBackend.BREAKABLE
+    else:
+        prefill_graph_backend = CudaGraphBackend.DISABLED
+    overrides = build_generation_batch_overrides(
+        max_running_requests=64,
+        server_args_overrides=server_args_overrides,
+        disable_cuda_graph=False,
+        # note (zhaochenyang20): MoE CUDA graph capture fails on topk_ids dtype under torch compile.
+        enable_torch_compile=False,
+        enable_mixed_chunk=True,
+        chunked_prefill_size=8192,
+        sampling_backend="flashinfer" if current_platform.is_cuda() else "pytorch",
+        cuda_graph_backend_prefill=prefill_graph_backend,
+    )
+    overrides["tp_size"] = tp_size
+    if execution_mode == "session":
+        overrides["enable_streaming_session"] = True
+    else:
+        pass
+
+    if not current_platform.enable_thinker_decode_graph():
+        overrides.setdefault("disable_decode_cuda_graph", True)
+    else:
+        pass
+    has_explicit_colocated_mem_fraction = (
+        total_gpu_memory_fraction is not None
+        and overrides.get("mem_fraction_static") is not None
+    )
+    colocated_encoder_mem_reserve = (
+        encoder_mem_reserve
+        if total_gpu_memory_fraction is not None
+        and not has_explicit_colocated_mem_fraction
+        else 0.0
+    )
+    memory_contract = apply_colocated_ar_memory_contract(
+        overrides,
+        stage_name="thinker",
+        total_gpu_memory_fraction=total_gpu_memory_fraction,
+        encoder_mem_reserve=colocated_encoder_mem_reserve,
+    )
+    pin_resolved_device_type(overrides, concrete_device.type)
+    server_args = build_sglang_server_args(
+        model_path,
+        context_length=max_seq_len,
+        **overrides,
+    )
+    validate_generation_batch_policy(
+        model_name="Qwen3-Omni thinker",
+        server_args=server_args,
+    )
+    if total_gpu_memory_fraction is None:
+        from sglang_omni.scheduling.stage_kv_budget import peek_stage_kv_cache_bytes
+
+        # Note (Jiaxin Deng): under a byte budget the KV configurator ignores
+        # mem_fraction_static, so an encoder reserve would be a silent no-op.
+        if peek_stage_kv_cache_bytes() is not None:
+            logger.info(
+                "thinker declares engine.kv_cache_bytes; skipping the "
+                f"encoder_mem_reserve={encoder_mem_reserve} fraction adjustment"
+            )
+            encoder_reserve_applied = False
+        else:
+            encoder_reserve_applied = apply_qwen_thinker_encoder_reserve(
+                server_args,
+                has_explicit_mem_fraction_static=(
+                    memory_contract.mem_fraction_static_pinned
+                ),
+                encoder_mem_reserve=encoder_mem_reserve,
+            )
+        effective_total_gpu_memory_fraction = total_gpu_memory_fraction
+        applied_encoder_reserve = (
+            encoder_mem_reserve if encoder_reserve_applied else 0.0
+        )
+    else:
+        effective_total_gpu_memory_fraction = (
+            memory_contract.effective_total_gpu_memory_fraction
+        )
+        applied_encoder_reserve = memory_contract.applied_encoder_mem_reserve
+
+    from sglang.srt.arg_groups.model_override_base import resolved_view
+
+    cfg = resolved_view(server_args)
+    pre_load_avail_mem = avail_gpu_mem(gpu_id)
+    pre_load_process_mem = get_process_gpu_memory_bytes(gpu_id)
+    logger.info(
+        f"sglang_ar_startup stage=thinker gpu_id={gpu_id} tp_rank={tp_rank}/{tp_size} "
+        f"context_length={max_seq_len} "
+        f"total_gpu_memory_fraction={total_gpu_memory_fraction} "
+        f"effective_total_gpu_memory_fraction={effective_total_gpu_memory_fraction} "
+        f"mem_fraction_static={cfg.mem_fraction_static} "
+        f"encoder_mem_reserve={applied_encoder_reserve} "
+        f"pre_load_avail_mem={pre_load_avail_mem} "
+        f"pid={os.getpid()} "
+        f"pre_load_process_mem={format_bytes_gib(pre_load_process_mem)}"
+    )
+    scheduler = create_thinker_scheduler(
+        server_args,
+        gpu_id,
+        speech_enabled=speech_enabled,
+        execution_mode=execution_mode,
+        tp_rank=tp_rank,
+        nccl_port=nccl_port,
+        total_gpu_memory_fraction=effective_total_gpu_memory_fraction,
+        enable_async_decode=enable_async_decode,
+        async_decode_min_batch_size=async_decode_min_batch_size,
+        prefill_coalesce_requests=prefill_coalesce_requests,
+        prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
+        prefill_coalesce_when_idle=prefill_coalesce_when_idle,
+        operator_selected_prefill_backend=operator_selected_prefill_backend(
+            server_args_overrides
+        ),
+        continuation_aware_admission=continuation_aware_admission,
+    )
+    from sglang.srt.runtime_context import get_schedule
+
+    post_load_process_mem = get_process_gpu_memory_bytes(gpu_id)
+    logger.info(
+        f"sglang_ar_started stage=thinker gpu_id={gpu_id} tp_rank={tp_rank}/{tp_size} "
+        f"context_length={max_seq_len} "
+        f"total_gpu_memory_fraction={total_gpu_memory_fraction} "
+        f"effective_total_gpu_memory_fraction={effective_total_gpu_memory_fraction} "
+        f"mem_fraction_static={get_schedule().mem_fraction_static} "
+        f"pre_load_avail_mem={pre_load_avail_mem} "
+        f"post_load_avail_mem={avail_gpu_mem(gpu_id)} "
+        f"pid={os.getpid()} "
+        f"pre_load_process_mem={format_bytes_gib(pre_load_process_mem)}"
+        f" post_load_process_mem={format_bytes_gib(post_load_process_mem)}"
+    )
+    return scheduler
+
+
+# note (ratish): the talker prefills unchunked, so no chunk bounds the capture;
+# forwards above this many tokens run eager.
+TALKER_PREFILL_CUDA_GRAPH_MAX_TOKENS = 2048
+
+
+def create_talker_ar_executor_from_config(
+    model_path: str,
+    *,
+    device: str | None = None,
+    gpu_id: int | None = None,
+    tp_rank: int = 0,
+    tp_size: int = 1,
+    nccl_port: int | None = None,
+    max_seq_len: int | None = None,
+    max_running_requests: int,
+    server_args_overrides: Mapping[str, object] | None = None,
+    speech_enabled: bool = True,
+    feedback_enabled: bool = True,
+    weight_prefix: str = "talker.",
+    total_gpu_memory_fraction: float | None = None,
+    enable_partial_start: bool = False,
+    partial_start_min_chunks: int = 5,
+    enable_talker_start_topology: bool = False,
+    code2wav_in_process: bool = False,
+    codec_coalesce_frames: int = 0,
+    codec_coalesce_first_frames: int = 0,
+    codec_coalesce_early_frames: int = 0,
+    execution_mode: Literal["request", "session"] = "request",
+    continuation_aware_admission: bool = True,
+) -> QwenTalkerScheduler:
+    """Returns OmniScheduler for talker."""
+    from sglang_omni.models.qwen3_omni.bootstrap import create_talker_scheduler
+    from sglang_omni.platforms import current_platform
+    from sglang_omni.scheduling.sglang_backend import pin_resolved_device_type
+    from sglang_omni.utils.device import resolve_concrete_device
+
+    concrete_device = resolve_concrete_device(device, gpu_id)
+    gpu_id = concrete_device.index or 0
+
+    # Note (Xuesong, Chenyang): cuda_graph defaults to ON for the talker
+    # after #384, which routed talker MoE through `self.experts` (FusedMoE)
+    # — the `fused_experts (full graph)` backend picked in #344. Caller can
+    # override via the talker stage's engine.disable_cuda_graph setting.
+    # Note (Xuesong): pytorch backend works around an sglang upstream gap —
+    # Sampler.forward doesn't forward seed to flashinfer, so
+    # under cuda graph the captured RNG is boot-dependent and ~5% of prompts
+    # trigger degenerate AR loops (see #408). Revert once upstream lands.
+    if current_platform.is_cuda() and current_platform.enable_talker_graph():
+        prefill_graph_backend = CudaGraphBackend.BREAKABLE
+    else:
+        prefill_graph_backend = CudaGraphBackend.DISABLED
+    overrides = build_generation_batch_overrides(
+        max_running_requests=max_running_requests,
+        server_args_overrides=server_args_overrides,
+        disable_cuda_graph=False,
+        # note (zhaochenyang20): the native rotary path under torch compile rejects fused_set_kv_buffer_arg.
+        enable_torch_compile=False,
+        sampling_backend="pytorch",
+        cuda_graph_backend_prefill=prefill_graph_backend,
+        cuda_graph_bs_prefill=build_default_prefill_cuda_graph_bs(
+            TALKER_PREFILL_CUDA_GRAPH_MAX_TOKENS
+        ),
+    )
+
+    # A platform may decline the default above; the caller's setting still wins.
+    stated_disable = "disable_cuda_graph" in (server_args_overrides or {})
+    if not stated_disable and not current_platform.enable_talker_graph():
+        overrides["disable_cuda_graph"] = True
+    else:
+        pass
+    overrides["tp_size"] = tp_size
+    if execution_mode == "session":
+        overrides["enable_streaming_session"] = True
+    else:
+        pass
+    apply_colocated_ar_memory_contract(
+        overrides,
+        stage_name="talker_ar",
+        total_gpu_memory_fraction=total_gpu_memory_fraction,
+    )
+    pin_resolved_device_type(overrides, concrete_device.type)
+    server_args = build_sglang_server_args(
+        model_path,
+        context_length=max_seq_len,
+        **overrides,
+    )
+    validate_generation_batch_policy(
+        model_name="Qwen3-Omni talker_ar",
+        server_args=server_args,
+    )
+    from sglang.srt.arg_groups.model_override_base import resolved_view
+
+    cfg = resolved_view(server_args)
+    pre_load_avail_mem = avail_gpu_mem(gpu_id)
+    pre_load_process_mem = get_process_gpu_memory_bytes(gpu_id)
+    logger.info(
+        f"sglang_ar_startup stage=talker_ar gpu_id={gpu_id} tp_rank={tp_rank}/{tp_size} "
+        f"context_length={max_seq_len} "
+        f"total_gpu_memory_fraction={total_gpu_memory_fraction} "
+        f"mem_fraction_static={cfg.mem_fraction_static} "
+        f"pre_load_avail_mem={pre_load_avail_mem} "
+        f"pid={os.getpid()} "
+        f"pre_load_process_mem={format_bytes_gib(pre_load_process_mem)}"
+    )
+    scheduler = create_talker_scheduler(
+        server_args,
+        gpu_id,
+        weight_prefix=weight_prefix,
+        speech_enabled=speech_enabled,
+        execution_mode=execution_mode,
+        feedback_enabled=feedback_enabled,
+        tp_rank=tp_rank,
+        nccl_port=nccl_port,
+        total_gpu_memory_fraction=total_gpu_memory_fraction,
+        enable_partial_start=enable_partial_start,
+        partial_start_min_chunks=partial_start_min_chunks,
+        enable_talker_start_topology=enable_talker_start_topology,
+        code2wav_in_process=code2wav_in_process,
+        operator_selected_prefill_backend=operator_selected_prefill_backend(
+            server_args_overrides
+        ),
+        codec_coalesce_frames=codec_coalesce_frames,
+        codec_coalesce_first_frames=codec_coalesce_first_frames,
+        codec_coalesce_early_frames=codec_coalesce_early_frames,
+        continuation_aware_admission=continuation_aware_admission,
+    )
+    from sglang.srt.runtime_context import get_schedule
+
+    post_load_process_mem = get_process_gpu_memory_bytes(gpu_id)
+    logger.info(
+        f"sglang_ar_started stage=talker_ar gpu_id={gpu_id} tp_rank={tp_rank}/{tp_size} "
+        f"context_length={max_seq_len} "
+        f"total_gpu_memory_fraction={total_gpu_memory_fraction} "
+        f"mem_fraction_static={get_schedule().mem_fraction_static} "
+        f"pre_load_avail_mem={pre_load_avail_mem} "
+        f"post_load_avail_mem={avail_gpu_mem(gpu_id)} "
+        f"pid={os.getpid()} "
+        f"pre_load_process_mem={format_bytes_gib(pre_load_process_mem)}"
+        f" post_load_process_mem={format_bytes_gib(post_load_process_mem)}"
+    )
+    return scheduler

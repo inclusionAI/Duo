@@ -1,0 +1,247 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Bucketed CUDA graphs for the Fun-ASR audio encoder + adaptor.
+
+The encoder forward is launch-bound: hundreds of small kernels whose CPU-side
+dispatch (Python launcher glue + driver calls) dwarfs the GPU time. Replaying
+a captured graph reduces the whole forward to a single launch.
+
+Unlike the MOSS-TD Whisper runner (fixed input length, only the chunk count
+varies), Fun-ASR varies in two dims: batch size (1..pre_lm_max_batch_size)
+and LFR frame count (up to ~500 for the 30 s clip limit). We bucket both and
+pad up on replay:
+
+* batch rows are padded with ``ilens=1`` silence rows (a fully-masked row
+  would produce NaN through SDPA; one valid zero frame keeps the row finite
+  and its output is discarded),
+* time is padded with masked frames — the same masking the eager batched
+  path already applies to every non-longest item in a batch.
+
+The SANM mask is derived from a static lengths tensor *inside* the capture,
+so a replay only needs ``copy_`` of the input features and lengths.
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+from typing import List, Optional, Tuple
+
+import torch
+from sglang.srt.utils.common import get_available_gpu_memory
+
+from sglang_omni.platforms import current_platform
+from sglang_omni.platforms.device_graph import DeviceGraphBackend
+
+from .sglang_model import sanm_mask_from_lengths
+
+logger = logging.getLogger(__name__)
+
+_BATCH_BUCKETS = (1, 2, 4, 8)
+_T_BUCKET_STEP = 64
+_T_BUCKET_MAX = 512  # 30 s * (1000 ms / 60 ms per LFR frame) ~= 500 frames
+
+
+def bucket_batch(b: int, max_batch: int) -> int | None:
+    for bucket in _BATCH_BUCKETS:
+        if bucket > max_batch:
+            break
+        else:
+            pass
+        if bucket >= b:
+            return bucket
+        else:
+            pass
+    return max_batch if b <= max_batch else None
+
+
+def bucket_t(t: int) -> int | None:
+    if t > _T_BUCKET_MAX:
+        return None
+    else:
+        pass
+    bucket = ((t + _T_BUCKET_STEP - 1) // _T_BUCKET_STEP) * _T_BUCKET_STEP
+    return max(bucket, _T_BUCKET_STEP)
+
+
+class FunASREncoderCudaGraphRunner:
+    """Capture-once/replay per (batch, LFR-length) bucket.
+
+    Holds references to the *eager* audio_tower and multi_modal_projector;
+    capturing dynamo-compiled callables is unsupported.
+    """
+
+    def __init__(
+        self,
+        audio_tower,
+        multi_modal_projector,
+        *,
+        graph_backend: DeviceGraphBackend,
+        max_batch_size: int = 8,
+        min_free_gb: float = 3.0,
+        warmup_iters: int = 3,
+    ) -> None:
+        self.audio_tower = audio_tower
+        self.projector = multi_modal_projector
+        self.graph_backend = graph_backend
+        reference = next(audio_tower.parameters())
+        self.device = reference.device
+        self.dtype = reference.dtype
+        self.device_module = torch.get_device_module(self.device)
+        self.max_batch = max(int(max_batch_size), 1)
+        self.min_free_gb = float(min_free_gb)
+        self.warmup_iters = int(warmup_iters)
+        # (batch_bucket, t_bucket) -> (graph, static_xs, static_ilens, static_out)
+        self.graphs: dict[Tuple[int, int], tuple] = {}
+        self.failed: set[Tuple[int, int]] = set()
+        self.pool = None
+        # note (wilsonzheng0327): serializes capture and replay -- replay
+        # mutates the bucket's static buffers, and both the pre-LM worker and
+        # the scheduler's inline prefill path can reach get_audio_feature.
+        self.lock = threading.Lock()
+        self.done_event = self.device_module.Event()
+        self.event_recorded = False
+
+    def forward(self, xs: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+        enc_out = self.audio_tower(xs, mask)
+        return self.projector(enc_out, mask)
+
+    def enough_free_gb(self) -> tuple[bool, float]:
+        free_gb = get_available_gpu_memory(
+            self.device.type,
+            self.device.index or 0,
+            distributed=False,
+            empty_cache=False,
+        )
+        return free_gb >= self.min_free_gb, free_gb
+
+    def capture(self, batch_bucket: int, t_bucket: int, feat_dim: int) -> tuple:
+        static_xs = torch.zeros(
+            batch_bucket, t_bucket, feat_dim, device=self.device, dtype=self.dtype
+        )
+        static_ilens = torch.ones(batch_bucket, device=self.device, dtype=torch.long)
+
+        def _masked_forward() -> torch.Tensor:
+            mask = sanm_mask_from_lengths(
+                static_ilens, t_bucket, dtype=self.dtype, device=self.device
+            )
+            return self.forward(static_xs, mask)
+
+        with current_platform.graph_capture_attention():
+            # note (wilsonzheng0327): warmup on a fresh stream so allocator state
+            # settles before capture.
+            stream = self.device_module.Stream(device=self.device)
+            stream.wait_stream(self.device_module.current_stream())
+            with self.device_module.stream(stream):
+                for _ in range(self.warmup_iters):
+                    _masked_forward()
+            self.device_module.current_stream().wait_stream(stream)
+            self.device_module.synchronize()
+
+            if self.pool is None:
+                # note (siju): one pool for every bucket. The replay lock keeps
+                # a capture or replay from overlapping another, and the output
+                # is cloned out before the lock is released.
+                self.pool = self.device_module.graph_pool_handle()
+            else:
+                pass
+            entry_stream = self.device_module.current_stream(self.device)
+            try:
+                with self.graph_backend.capture(
+                    pool=self.pool, thread_local_errors=True
+                ) as graph:
+                    static_out = _masked_forward()
+            finally:
+                self.device_module.set_stream(entry_stream)
+        logger.info(
+            "Captured Fun-ASR encoder CUDA graph batch=%d t=%d -> out %s "
+            "(%d cached)",
+            batch_bucket,
+            t_bucket,
+            tuple(static_out.shape),
+            len(self.graphs) + 1,
+        )
+        return graph, static_xs, static_ilens, static_out
+
+    @torch.no_grad()
+    def run(self, xs: torch.Tensor, lengths: List[int]) -> Optional[torch.Tensor]:
+        """Replay for ``xs`` [B, T, feat] with per-item valid ``lengths``.
+
+        Returns adaptor output ``[B, T', llm_dim]`` for the real batch rows,
+        or None when no bucket fits / capture failed (caller falls back to
+        the eager path).
+        """
+        b, t, feat_dim = xs.shape
+        batch_bucket = bucket_batch(b, self.max_batch)
+        t_bucket = bucket_t(t)
+        if batch_bucket is None or t_bucket is None:
+            return None
+        else:
+            pass
+        key = (batch_bucket, t_bucket)
+        if key in self.failed:
+            return None
+        else:
+            pass
+
+        with self.lock:
+            entry = self.graphs.get(key)
+            if entry is None:
+                # note (siju): both the memory probe and the capture need this
+                # card current, and the pre-LM worker thread sits on device 0.
+                with self.device_module.device(self.device):
+                    enough, free_gb = self.enough_free_gb()
+                    if not enough:
+                        logger.warning(
+                            f"Fun-ASR encoder CUDA graph: free VRAM "
+                            f"{free_gb:.1f}GB < {self.min_free_gb:.1f}GB "
+                            f"headroom; running batch={batch_bucket} "
+                            f"t={t_bucket} eager"
+                        )
+                        self.failed.add(key)
+                        return None
+                    else:
+                        pass
+                    try:
+                        entry = self.capture(batch_bucket, t_bucket, feat_dim)
+                    except Exception as exc:
+                        logger.warning(
+                            f"Fun-ASR encoder CUDA graph capture failed for "
+                            f"batch={batch_bucket} t={t_bucket}: {exc}; using "
+                            f"eager for this bucket",
+                            exc_info=True,
+                        )
+                        self.failed.add(key)
+                        return None
+                self.graphs[key] = entry
+            else:
+                pass
+
+            graph, static_xs, static_ilens, static_out = entry
+            if static_xs.shape[-1] != feat_dim:
+                return None
+            else:
+                pass
+            stream = self.device_module.current_stream(self.device)
+            # note (wilsonzheng0327): wait for previous caller's output copy
+            # on some stream to finish before using shared resource
+            if self.event_recorded:
+                self.done_event.wait(stream)
+            else:
+                pass
+            static_xs.zero_()
+            static_xs[:b, :t].copy_(xs, non_blocking=True)
+            # Padded rows keep ilens=1: one valid zeroed frame, output dropped.
+            static_ilens.fill_(1)
+            static_ilens[:b].copy_(
+                torch.as_tensor(lengths, dtype=torch.long), non_blocking=True
+            )
+            graph.replay()
+            # note (wilsonzheng0327): the next call needs to wait on this
+            # event before it touches anything shared to ensure clone finishes
+            out = static_out[:b].clone()
+            self.done_event.record(stream)
+            self.event_recorded = True
+            return out
+
+
+__all__ = ["FunASREncoderCudaGraphRunner"]

@@ -1,0 +1,845 @@
+import logging
+import math
+import re
+from collections.abc import Mapping
+from typing import Iterable, Optional, Tuple
+
+import torch
+from sglang.kernels.fused_op import get_fused_op_backend
+from sglang.kernels.spec import KernelBackend
+from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
+from torch import nn
+from transformers import PretrainedConfig
+
+from sglang_omni.models.qwen3_omni.hf_config import Qwen3OmniMoeTextConfig
+from sglang_omni.models.weight_loader import default_weight_loader
+from sglang_omni.platforms import current_platform
+from sglang_omni.quantization import get_weight_preprocessor
+from sglang_omni.utils import add_prefix
+from sglang_omni.vendor.sglang.core import ForwardBatch
+from sglang_omni.vendor.sglang.layers import (
+    AuxHiddenStateList,
+    MRotaryEmbedding,
+    QKVParallelLinear,
+    QuantizationConfig,
+    RadixAttention,
+    ReplicatedLinear,
+    RMSNorm,
+    RoutingMethodType,
+    RowParallelLinear,
+    StageDeclaration,
+    TopK,
+    VocabParallelEmbedding,
+    append_stages,
+    declare_attn,
+    declare_ffn,
+    get_moe_impl_class,
+    get_rope,
+    residual_batch,
+)
+from sglang_omni.vendor.sglang.models import (
+    apply_qk_norm,
+    create_fused_set_kv_buffer_arg,
+    enable_fused_set_kv_buffer,
+)
+from sglang_omni.vendor.sglang.utils import make_layers
+
+fused_qk_norm_rope = current_platform.get_fused_qk_norm_rope()
+
+logger = logging.getLogger(__name__)
+
+
+def bind_default_weight_loaders(module: nn.Module) -> None:
+    for param in module.parameters():
+        if not hasattr(param, "weight_loader"):
+            param.weight_loader = default_weight_loader
+        else:
+            pass
+
+
+def compute_yarn_parameters(
+    config: PretrainedConfig,
+) -> tuple[float, float, float, float]:
+    """
+    Refer to https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_rope_utils.py#L197C1-L288C1
+    Computes the inverse frequencies with NTK scaling. Please refer to the
+    [original paper](https://huggingface.co/papers/2309.00071)
+    Args:
+        config ([`~transformers.PretrainedConfig`]):
+            The model configuration.
+    Returns:
+        factor: float, the scaling factor for the RoPE embeddings
+        low: float, the lower bound of the dimension range
+        high: float, the upper bound of the dimension range
+        attention_factor: float, the post-processing scaling factor applied to the computed cos/sin
+    """
+
+    # The config does not contain rope_scaling, which means the model is not using yarn
+    rope_scaling = config.rope_scaling
+    if rope_scaling is None:
+        return 1.0, 0, 0, 1.0
+    else:
+        pass
+
+    base = config.rope_theta
+    partial_rotary_factor = config.partial_rotary_factor
+    head_dim = config.head_dim
+    dim = int(head_dim * partial_rotary_factor)
+    factor = rope_scaling.get("factor", 1.0)
+    attention_factor = rope_scaling.get("attention_factor")
+    mscale = rope_scaling.get("mscale")
+    mscale_all_dim = rope_scaling.get("mscale_all_dim")
+
+    if "original_max_position_embeddings" in rope_scaling:
+        original_max_position_embeddings = rope_scaling[
+            "original_max_position_embeddings"
+        ]
+        factor = config.max_position_embeddings / original_max_position_embeddings
+    else:
+        original_max_position_embeddings = config.max_position_embeddings
+
+    def get_mscale(scale, mscale=1):
+        if scale <= 1:
+            return 1.0
+        else:
+            pass
+        return 0.1 * mscale * math.log(scale) + 1.0
+
+    # Sets the attention factor as suggested in the paper
+    if attention_factor is None:
+        if mscale and mscale_all_dim:
+            attention_factor = float(
+                get_mscale(factor, mscale) / get_mscale(factor, mscale_all_dim)
+            )
+        else:
+            attention_factor = get_mscale(factor)
+    else:
+        pass
+
+    # Optional config options
+    # beta_fast/beta_slow: as suggested in the paper, default to 32/1 (correspondingly)
+    beta_fast = rope_scaling.get("beta_fast") or 32
+    beta_slow = rope_scaling.get("beta_slow") or 1
+
+    # Compute the inverse frequencies
+    def find_correction_dim(num_rotations, dim, base, max_position_embeddings):
+        """Inverse dimension formula to find the dimension based on the number of rotations"""
+        return (
+            dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))
+        ) / (2 * math.log(base))
+
+    def find_correction_range(
+        low_rot, high_rot, dim, base, max_position_embeddings, truncate
+    ):
+        """Find dimension range bounds based on rotations"""
+        low = find_correction_dim(low_rot, dim, base, max_position_embeddings)
+        high = find_correction_dim(high_rot, dim, base, max_position_embeddings)
+        if truncate:
+            low = math.floor(low)
+            high = math.ceil(high)
+        else:
+            pass
+        return max(low, 0), min(high, dim - 1)
+
+    truncate = rope_scaling.get("truncate", True)
+    low, high = find_correction_range(
+        beta_fast, beta_slow, dim, base, original_max_position_embeddings, truncate
+    )
+
+    return factor, low, high, attention_factor
+
+
+class Qwen3OmniMoeThinkerTextAttention(nn.Module):
+    """
+    Omni tailed version of qwen3_moe.py:Qwen3MoeAttention
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        layer_id: int = 0,
+        rope_theta: float = 10000,
+        rope_scaling: Optional[Mapping[str, object]] = None,
+        max_position_embeddings: int = 8192,
+        head_dim: Optional[int] = None,
+        rms_norm_eps: float = 1e-06,
+        attention_bias: bool = False,
+        config: Optional[PretrainedConfig] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        dual_chunk_attention_config: Optional[Mapping[str, object]] = None,
+        alt_stream: Optional[torch.Stream] = None,
+    ) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.layer_id = layer_id
+
+        attn_tp_size = get_parallel().attn_tp_size
+
+        self.config = config
+        self.total_num_heads = num_heads
+        assert self.total_num_heads % attn_tp_size == 0
+        self.num_heads = self.total_num_heads // attn_tp_size
+        self.total_num_kv_heads = num_kv_heads
+        if self.total_num_kv_heads >= attn_tp_size:
+            # Number of KV heads is greater than TP size, so we partition
+            # the KV heads across multiple tensor parallel GPUs.
+            assert self.total_num_kv_heads % attn_tp_size == 0
+        else:
+            # Number of KV heads is less than TP size, so we replicate
+            # the KV heads across multiple tensor parallel GPUs.
+            assert attn_tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // attn_tp_size)
+        self.head_dim = head_dim or hidden_size // self.total_num_heads
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.scaling = self.head_dim**-0.5
+        self.rope_theta = rope_theta
+        self.max_position_embeddings = max_position_embeddings
+        self.tp_rank = get_parallel().tp_rank
+
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size,
+            self.head_dim,
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            bias=attention_bias,
+            quant_config=quant_config,
+            parallel_group="attn_tp",
+            prefix=add_prefix("qkv_proj", prefix),
+        )
+
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            hidden_size,
+            bias=attention_bias,
+            quant_config=quant_config,
+            parallel_group="attn_tp",
+            reduce_results=False,
+            prefix=add_prefix("o_proj", prefix),
+        )
+
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            rotary_dim=self.head_dim,
+            max_position=max_position_embeddings,
+            base=rope_theta,
+            rope_scaling=rope_scaling,
+            dual_chunk_attention_config=dual_chunk_attention_config,
+        )
+        self.compatible_with_fused_kv_buffer = (
+            False if isinstance(self.rotary_emb, MRotaryEmbedding) else True
+        )
+        self.compatible_with_fused_qk_norm_rope = (
+            not isinstance(self.rotary_emb, MRotaryEmbedding)
+        ) and self.head_dim in (64, 128, 256)
+        self.use_fused_qk_norm_rope = (
+            get_exec().kernel.enable_fused_qk_norm_rope
+            and self.compatible_with_fused_qk_norm_rope
+            and fused_qk_norm_rope is not None
+        )
+        self.used_fused_qk_norm_rope_last_call = False
+        self.used_fused_set_kv_buffer_last_call = False
+
+        self.attn = RadixAttention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            layer_id=layer_id,
+            prefix=add_prefix("attn", prefix),
+        )
+
+        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.alt_stream = alt_stream
+
+    def forward_prepare_native(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        qkv, _ = self.qkv_proj(hidden_states)
+
+        q, k, v = self.apply_qk_norm_rope(qkv, positions, forward_batch)
+
+        inner_state = q, k, v, forward_batch
+        return None, forward_batch, inner_state
+
+    def apply_qk_norm_rope(self, qkv, positions, forward_batch):
+        # Note:(Chenchen Hong) the talker uses a base (non-MRoPE) RotaryEmbedding
+        # but post1 still passes MRoPE [3, seq] positions; collapse to the
+        # temporal row so it isn't misread as 3 batches (all sections equal here).
+        if positions.dim() == 2 and not isinstance(self.rotary_emb, MRotaryEmbedding):
+            positions = positions[0]
+        else:
+            pass
+        use_fused = self.use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16
+        if use_fused:
+            theta = self.config.rope_theta
+            positions = (
+                positions.view(-1).to(dtype=torch.int32, device=qkv.device).contiguous()
+            )
+            factor, low, high, attention_factor = compute_yarn_parameters(self.config)
+            fused_qk_norm_rope(
+                qkv,
+                self.num_heads,
+                self.num_kv_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.q_norm.variance_epsilon,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                theta,
+                self.rotary_emb.is_neox_style,
+                positions,
+                factor,
+                low,
+                high,
+                attention_factor,
+            )
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            self.used_fused_qk_norm_rope_last_call = True
+            self.used_fused_set_kv_buffer_last_call = False
+        else:
+            # Fallback to non-fused QK Norm & RoPE implementation
+            q_linear, k_linear, v = qkv.split(
+                [self.q_size, self.kv_size, self.kv_size], dim=-1
+            )
+            q, k = apply_qk_norm(
+                q=q_linear,
+                k=k_linear,
+                q_norm=self.q_norm,
+                k_norm=self.k_norm,
+                head_dim=self.head_dim,
+                alt_stream=self.alt_stream,
+            )
+            # note (ratish): a forced torch backend runs the rope's native
+            # forward, which cannot store K and V, so attention stores them.
+            use_fused_set_kv_buffer = (
+                current_platform.is_cuda()
+                and enable_fused_set_kv_buffer(forward_batch)
+                and self.compatible_with_fused_kv_buffer
+                and get_fused_op_backend()
+                not in (KernelBackend.TORCH, KernelBackend.TORCH_COMPILE)
+            )
+            q, k = self.rotary_emb(
+                positions,
+                q,
+                k,
+                fused_set_kv_buffer_arg=(
+                    create_fused_set_kv_buffer_arg(
+                        value=v,
+                        layer=self.attn,
+                        forward_batch=forward_batch,
+                    )
+                    if use_fused_set_kv_buffer
+                    else None
+                ),
+            )
+            self.used_fused_qk_norm_rope_last_call = False
+            self.used_fused_set_kv_buffer_last_call = use_fused_set_kv_buffer
+        return q, k, v
+
+    def forward_prepare(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        if hidden_states.shape[0] == 0:
+            return hidden_states, forward_batch, None
+        else:
+            pass
+        return self.forward_prepare_native(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+        )
+
+    def forward_core(self, intermediate_state):
+        hidden_states, forward_batch, inner_state = intermediate_state
+        if inner_state is None:
+            return hidden_states
+        else:
+            pass
+
+        q, k, v, fb = inner_state
+
+        must_save_kv = self.used_fused_qk_norm_rope_last_call
+        save_kv_cache = must_save_kv or not self.used_fused_set_kv_buffer_last_call
+        attn_output = self.attn(
+            q,
+            k,
+            v,
+            fb,
+            save_kv_cache=save_kv_cache,
+        )
+        # Note:(Chenchen Hong) cast attn output to the compute dtype (v.dtype),
+        # not o_proj.weight.dtype: for FP8 weights the latter feeds an fp8
+        # activation to the quantizer, which post1's sgl_kernel rejects.
+        if attn_output.dtype != v.dtype:
+            attn_output = attn_output.to(dtype=v.dtype)
+        else:
+            pass
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        s = self.forward_prepare(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+        )
+        return self.forward_core(s)
+
+
+class Qwen3OmniMoeThinkerTextSparseMoeBlock(nn.Module):
+    """
+    Omni version of Qwen3MoeSparseMoeBlock
+    """
+
+    def __init__(
+        self,
+        layer_id: int,
+        config: Qwen3OmniMoeTextConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.tp_size = get_parallel().tp_size
+        self.layer_id = layer_id
+        if self.tp_size > config.num_experts:
+            raise ValueError(
+                f"Tensor parallel size {self.tp_size} is greater than "
+                f"the number of experts {config.num_experts}."
+            )
+        else:
+            pass
+
+        self.topk = TopK(
+            top_k=config.num_experts_per_tok,
+            renormalize=config.norm_topk_prob,
+            use_grouped_topk=False,
+            layer_id=layer_id,
+        )
+
+        self.experts = get_moe_impl_class(quant_config)(
+            num_experts=config.num_experts + get_exec().moe.ep_num_redundant_experts,
+            top_k=config.num_experts_per_tok,
+            layer_id=layer_id,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            quant_config=quant_config,
+            prefix=add_prefix("experts", prefix),
+            routing_method_type=RoutingMethodType.Renormalize,
+        )
+
+        self.gate = ReplicatedLinear(
+            config.hidden_size,
+            config.num_experts,
+            bias=False,
+            quant_config=None,
+            prefix=add_prefix("gate", prefix),
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+    ) -> torch.Tensor:
+
+        return self.forward_normal(hidden_states)
+
+    def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        num_tokens, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+
+        # router_logits: (num_tokens, n_experts)
+        router_logits, _ = self.gate(hidden_states)
+        topk_output = self.topk(hidden_states, router_logits)
+        final_hidden_states = self.experts(hidden_states, topk_output)
+        return final_hidden_states.view(num_tokens, hidden_dim)
+
+
+class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
+    sparse_moe_block_cls = Qwen3OmniMoeThinkerTextSparseMoeBlock
+
+    def __init__(
+        self,
+        config: Qwen3OmniMoeTextConfig,
+        layer_id: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        alt_stream: Optional[torch.Stream] = None,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        rope_theta = config.rope_theta
+        rope_scaling = config.rope_scaling
+        max_position_embeddings = config.max_position_embeddings
+        head_dim = config.head_dim
+        rms_norm_eps = config.rms_norm_eps
+        attention_bias = config.attention_bias
+        dual_chunk_attention_config = config.dual_chunk_attention_config
+        self.self_attn = Qwen3OmniMoeThinkerTextAttention(
+            hidden_size=self.hidden_size,
+            num_heads=config.num_attention_heads,
+            num_kv_heads=config.num_key_value_heads,
+            layer_id=layer_id,
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
+            max_position_embeddings=max_position_embeddings,
+            head_dim=head_dim,
+            rms_norm_eps=rms_norm_eps,
+            attention_bias=attention_bias,
+            config=config,
+            quant_config=quant_config,
+            prefix=add_prefix("self_attn", prefix),
+            dual_chunk_attention_config=dual_chunk_attention_config,
+            alt_stream=alt_stream,
+        )
+
+        self.layer_id = layer_id
+
+        self.attn_tp_size = get_parallel().attn_tp_size
+        self.attn_tp_rank = get_parallel().attn_tp_rank
+
+        attn, ffn = self.stage_facts(config, layer_id)
+        self.is_layer_sparse = ffn.sparse
+
+        if self.is_layer_sparse:
+            self.mlp = self.sparse_moe_block_cls(
+                layer_id=self.layer_id,
+                config=config,
+                quant_config=quant_config,
+                prefix=add_prefix("mlp", prefix),
+            )
+        else:
+            raise NotImplementedError(
+                "Dense MLP is not implemented in Qwen3OmniMoeThinkerTextDecoderLayer yet."
+            )
+
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @staticmethod
+    def stage_facts(
+        config: Qwen3OmniMoeTextConfig, layer_id: int
+    ) -> tuple[StageDeclaration, StageDeclaration]:
+        """The stages the layer declares, from the config alone (see make_layers)."""
+        # Qwen3MoE all layers are sparse and have no nextn now
+        is_layer_sparse = True
+        is_next_layer_sparse = True
+        return (
+            declare_attn(),
+            declare_ffn(sparse=is_layer_sparse, next_layer_sparse=is_next_layer_sparse),
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        captured_last_layer_outputs: Optional[AuxHiddenStateList] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states,
+            forward_batch,
+            capture_gathered=captured_last_layer_outputs,
+            **kwargs,
+        )
+
+        if hidden_states.shape[0] != 0:
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+        else:
+            pass
+
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+
+        hidden_states = self.mlp(hidden_states, forward_batch)
+        return self.ffn_boundary.finish(hidden_states, forward_batch)
+
+
+class Qwen3OmniMoeThinkerTextModel(nn.Module):
+    """
+    Qwen3 omni text thinker only (without AuT and ViT)
+    """
+
+    def __init__(
+        self,
+        config: Qwen3OmniMoeTextConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.config = config
+
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+
+        self.embed_tokens = VocabParallelEmbedding(
+            num_embeddings=config.vocab_size,
+            embedding_dim=config.hidden_size,
+            use_attn_tp_group=False,
+            prefix=add_prefix(prefix, "embed_tokens"),
+        )
+
+        alt_stream = get_stream("alt") if current_platform.is_cuda() else None
+        result = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: Qwen3OmniMoeThinkerTextDecoderLayer(
+                layer_id=idx,
+                config=config,
+                quant_config=quant_config,
+                prefix=prefix,
+                alt_stream=alt_stream,
+            ),
+            prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: Qwen3OmniMoeThinkerTextDecoderLayer.stage_facts(
+                config, idx
+            ),
+        )
+        self.layers = result
+        self.start_layer = 0
+        self.end_layer = config.num_hidden_layers
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        # For EAGLE3 support
+        self.layers_to_capture = []
+        bind_default_weight_loaders(self)
+        self.cached_params_dict = dict(self.named_parameters())
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        visual_pos_masks: Optional[torch.Tensor] = None,
+        deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
+    ):
+        if input_embeds is None:
+            hidden_states = self.embed_tokens(input_ids)
+        else:
+            hidden_states = input_embeds
+
+        residual_batch.start(forward_batch)
+        aux_hidden_states = AuxHiddenStateList()
+
+        # Capture word embeddings (before any transformer layer) if requested
+        if "embed" in self.layers_to_capture:
+            aux_hidden_states.append(("embed", hidden_states.clone()))
+        else:
+            pass
+
+        for layer_idx in range(self.start_layer, self.end_layer):
+            layer = self.layers[layer_idx]
+            hidden_states = layer(
+                positions,
+                hidden_states,
+                forward_batch,
+                captured_last_layer_outputs=(
+                    aux_hidden_states if layer_idx in self.layers_to_capture else None
+                ),
+            )
+            if deepstack_visual_embeds is not None and layer_idx in range(
+                len(deepstack_visual_embeds)
+            ):
+                hidden_states = self.deepstack_process(
+                    residual_batch.complete_output(hidden_states, forward_batch),
+                    visual_pos_masks,
+                    deepstack_visual_embeds[layer_idx],
+                )
+            else:
+                pass
+        hidden_states = residual_batch.final_norm(
+            hidden_states, forward_batch, self.norm, skip_empty=True
+        )
+
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+        else:
+            pass
+
+        return hidden_states, aux_hidden_states
+
+    def deepstack_process(self, hidden_states, visual_pos_masks, visual_embeds):
+        # visual_pos_masks may be 1D boolean (SGLang path) or multi-dim (HF path)
+        if visual_pos_masks.dim() > 1:
+            visual_pos_masks = visual_pos_masks[..., 0]
+        else:
+            pass
+        visual_pos_masks = visual_pos_masks.to(hidden_states.device)
+        visual_embeds = visual_embeds.to(hidden_states.device, hidden_states.dtype)
+        local_this = hidden_states[visual_pos_masks, :] + visual_embeds
+        hidden_states[visual_pos_masks, :] = local_this
+        return hidden_states
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        """ "
+        For Qwen3 omni thinker, the prefix of each part of weights are:
+
+        (audio_tower): Qwen3OmniMoeAudioEncoder
+        (visual): Qwen3OmniMoeVisionEncoder
+        (model): Qwen3OmniMoeThinkerTextModel
+        (lm_head): lm_head
+        """
+        params_dict = self.cached_params_dict
+
+        preprocess_weight = get_weight_preprocessor(
+            self.config, fp8_scale_inverted=True
+        )
+
+        for name, loaded_weight in weights:
+            if maybe_update_fused_qkv_proj(
+                params_dict=params_dict,
+                name=name,
+                loaded_weight=loaded_weight,
+                preprocess_weight=preprocess_weight,
+            ):
+                continue
+            elif maybe_update_fused_moe_proj(
+                params_dict=params_dict,
+                name=name,
+                loaded_weight=loaded_weight,
+                config=self.config,
+                preprocess_weight=preprocess_weight,
+            ):
+                continue
+            else:
+                if name in params_dict.keys():
+                    param = params_dict[name]
+                    loaded_weight = preprocess_weight(name, loaded_weight)
+                    param.weight_loader(param, loaded_weight)
+                    continue
+                else:
+                    pass
+            logger.warning(f"Parameter {name} not found in params_dict")
+
+
+def maybe_update_fused_qkv_proj(
+    params_dict,
+    name,
+    loaded_weight,
+    preprocess_weight,
+):
+    stacked_params_mapping = {
+        "q_proj": ("qkv_proj", "q"),
+        "k_proj": ("qkv_proj", "k"),
+        "v_proj": ("qkv_proj", "v"),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+    }
+
+    for shard_name in stacked_params_mapping:
+        if shard_name in name:
+            # Expert weights (mlp.experts.*) are handled by the MoE loader,
+            # not the fused QKV/gate_up_proj path.
+            if "mlp.experts" in name:
+                continue
+            else:
+                pass
+            fused_param_name, shard_id = stacked_params_mapping[shard_name]
+
+            name = name.replace(shard_name, fused_param_name)
+            param = params_dict[name]
+            loaded_weight = preprocess_weight(name, loaded_weight)
+            param.weight_loader(param, loaded_weight, shard_id)
+            return True
+        else:
+            pass
+    return False
+
+
+def maybe_update_fused_moe_proj(
+    params_dict, name, loaded_weight, config, preprocess_weight
+):
+    # replace FusedMoE.make_expert_params_mapping
+    if res := extract_fused_experts(
+        name=name,
+        ckpt_gate_proj_name="gate_proj",
+        ckpt_down_proj_name="down_proj",
+        ckpt_up_proj_name="up_proj",
+        num_experts=config.num_experts,
+    ):
+        param_name, weight_name, expert_id, shard_id = res
+
+        name = name.replace(weight_name, param_name)
+
+        if name in params_dict:
+            param = params_dict[name]
+            loaded_weight = preprocess_weight(name, loaded_weight)
+            param.weight_loader(
+                param,
+                loaded_weight,
+                name,
+                shard_id=shard_id,
+                expert_id=expert_id,
+            )
+            return True
+        else:
+            pass
+    else:
+        pass
+    return False
+
+
+def extract_fused_experts(
+    name,
+    ckpt_gate_proj_name: str,
+    ckpt_down_proj_name: str,
+    ckpt_up_proj_name: str,
+    num_experts: int,
+):
+    pattern = rf"experts\.(\d+)\.({ckpt_gate_proj_name}|{ckpt_down_proj_name}|{ckpt_up_proj_name})"
+
+    match = re.search(pattern, name)
+    if match:
+        expert_id = int(match.group(1))
+        weight_type = match.group(2)
+        if expert_id < num_experts:
+            # Determine param_name based on weight_type
+            param_name = (
+                "experts.w2_" if weight_type == ckpt_down_proj_name else "experts.w13_"
+            )
+            if weight_type == ckpt_gate_proj_name:
+                shard_id = "w1"
+            elif weight_type == ckpt_down_proj_name:
+                shard_id = "w2"
+            elif weight_type == ckpt_up_proj_name:
+                shard_id = "w3"
+            else:
+                pass
+            return param_name, f"experts.{expert_id}.{weight_type}", expert_id, shard_id
+        else:
+            pass
+    else:
+        pass
+
+    return None
+
+
+EntryClass = Qwen3OmniMoeThinkerTextModel

@@ -1,0 +1,1817 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Ming-Omni talker model.
+
+The internal LLM backbone (dense Qwen2, hidden=896), with device graph
+infrastructure, CFM/DiT/Aggregator modules and generation.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import math
+import queue
+import re
+import threading
+import uuid
+from concurrent.futures import CancelledError as FutureCancelledError
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+from queue import Queue
+from threading import Lock
+from typing import TYPE_CHECKING, Iterable, Optional, Tuple
+
+import torch
+import torch.nn as nn
+import torchaudio
+from transformers import Qwen2Config, Qwen2Model, StaticCache
+
+from sglang_omni.models.ming_omni.components.audio_encoder import autocast_context
+from sglang_omni.models.weight_loader import (
+    default_weight_loader,
+    load_weights_by_prefix,
+)
+from sglang_omni.modules.ming_audio.flow.aggregator import Aggregator
+from sglang_omni.modules.ming_audio.flow.cfm import CFM, get_epss_timesteps
+from sglang_omni.modules.ming_audio.flow.dit import DiT
+from sglang_omni.modules.ming_audio.flow.execution import TalkerExecutionConfig
+from sglang_omni.platforms import current_platform
+from sglang_omni.utils.audio_features import cached_fbank
+
+from .configuration_bailing_talker import MingOmniTalkerConfig
+from .device_runtime import TalkerDeviceRuntime
+from .front.number_en import normalize_numbers
+from .front.text_segment_cut import cut_text_by_semantic_length, is_chinese
+from .front.toolkit import tokenize_mixed_text_iterator
+from .talker_module.packed_qkv import (
+    PACKED_QKV_SHARD_IDS,
+    PackedQKVLinear,
+    load_packed_qkv_shard,
+)
+
+logger = logging.getLogger(__name__)
+
+_TOKEN_DONE = object()
+AR_CACHE_MAX_TOKENS = 512
+
+# ---------- Optional: onnxruntime for speaker embedding ----------
+try:
+    import onnxruntime
+
+    _HAS_ONNX = True
+except ImportError:
+    onnxruntime = None  # type: ignore[assignment]
+    _HAS_ONNX = False
+
+if TYPE_CHECKING:
+    from talker_tn.talker_tn import TalkerTN
+else:
+    pass
+
+
+class IdentityNormalizer:
+    """Fallback when TalkerTN (pynini) is not available."""
+
+    def normalize(self, text: str) -> str:
+        return text
+
+
+class SpkembExtractor:
+    """Extract speaker embeddings using CampPlus ONNX model."""
+
+    def __init__(self, campplus_model: str, target_sr: int = 16000):
+        if not _HAS_ONNX:
+            raise ImportError("onnxruntime is required for SpkembExtractor")
+        else:
+            pass
+        option = onnxruntime.SessionOptions()
+        option.graph_optimization_level = (
+            onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+        )
+        option.intra_op_num_threads = 2
+        self.campplus_session = onnxruntime.InferenceSession(
+            campplus_model, sess_options=option, providers=["CPUExecutionProvider"]
+        )
+        self.target_sr = target_sr
+
+    def extract_spk_embedding(self, speech):
+        feat = cached_fbank(speech, num_mel_bins=80, sample_frequency=16000)
+        feat = feat - feat.mean(dim=0, keepdim=True)
+        embedding = (
+            self.campplus_session.run(
+                None,
+                {
+                    self.campplus_session.get_inputs()[0]
+                    .name: feat.unsqueeze(dim=0)
+                    .cpu()
+                    .numpy()
+                },
+            )[0]
+            .flatten()
+            .tolist()
+        )
+        return torch.tensor([embedding])
+
+    def __call__(self, waveform, **kwargs) -> Optional[torch.Tensor]:
+        return self.extract_spk_embedding(waveform)
+
+
+class CFMGraphExecutor:
+    def __init__(self, config, cfm, aggregator, stop_head):
+        self.config = config
+        self.cfm = cfm
+        self.aggregator = aggregator
+        self.stop_head = stop_head
+        self.initialized = False
+        self.last_hidden_state_placeholder = None
+        self.his_lat_placeholder = None
+        self.randn_like_placeholder = None
+        self.t_placeholder = None
+        self.sde_args_placeholder = None
+        self.sde_rnd_placeholder = None
+        self.gen_lat_placeholder = None
+        self.inputs_embeds_placeholder = None
+        self.stop_out_placeholder = None
+        self.graph = None
+
+    def execute(
+        self,
+        input_tensor,
+        his_lat,
+        cfg_strength=2.0,
+        sigma=0.25,
+        temperature=0.0,
+        abort_event: threading.Event | None = None,
+    ):
+        if abort_event is not None and abort_event.is_set():
+            raise asyncio.CancelledError()
+        else:
+            pass
+        bat_size, his_patch_size, z_dim = his_lat.shape
+        randn_tensor = torch.randn(
+            (bat_size, self.config.patch_size, z_dim),
+            device=input_tensor.device,
+            dtype=input_tensor.dtype,
+        )
+        t = get_epss_timesteps(
+            self.config.steps, device=input_tensor.device, dtype=input_tensor.dtype
+        )
+        sde_rnd = torch.randn(
+            (self.config.steps, *randn_tensor.shape),
+            device=input_tensor.device,
+            dtype=input_tensor.dtype,
+        )
+
+        if not self.initialized:
+            if abort_event is not None and abort_event.is_set():
+                raise asyncio.CancelledError()
+            else:
+                pass
+            self.initialize_graph(
+                input_tensor,
+                his_lat,
+                randn_tensor,
+                t,
+                (cfg_strength, sigma, temperature),
+                sde_rnd,
+            )
+        else:
+            pass
+
+        self.last_hidden_state_placeholder.copy_(input_tensor)
+        self.his_lat_placeholder.copy_(his_lat)
+        self.randn_like_placeholder.copy_(randn_tensor)
+        self.t_placeholder.copy_(t)
+        self.sde_args_placeholder[0] = cfg_strength
+        self.sde_args_placeholder[1] = sigma
+        self.sde_args_placeholder[2] = temperature
+        self.sde_rnd_placeholder.copy_(sde_rnd)
+
+        if abort_event is not None and abort_event.is_set():
+            raise asyncio.CancelledError()
+        else:
+            pass
+        # Python abort checks inside CFM.sample run during capture; replay is
+        # bounded by explicit checks before and after the device graph replay.
+        self.graph.replay()
+        if abort_event is not None and abort_event.is_set():
+            raise asyncio.CancelledError()
+        else:
+            pass
+
+        gen_lat = torch.empty_like(self.gen_lat_placeholder)
+        gen_lat.copy_(self.gen_lat_placeholder)
+        inputs_embeds = torch.empty_like(self.inputs_embeds_placeholder)
+        inputs_embeds.copy_(self.inputs_embeds_placeholder)
+        stop_out = torch.empty_like(self.stop_out_placeholder)
+        stop_out.copy_(self.stop_out_placeholder)
+
+        return gen_lat, inputs_embeds, stop_out
+
+    def initialize_graph(
+        self,
+        input_tensor: torch.Tensor,
+        his_lat: torch.Tensor,
+        randn_tensor: torch.Tensor,
+        timesteps: torch.Tensor,
+        sde_args: tuple[float, float, float],
+        sde_rnd: torch.Tensor,
+    ) -> None:
+        self.last_hidden_state_placeholder = input_tensor.clone()
+        self.his_lat_placeholder = his_lat.clone()
+        self.randn_like_placeholder = randn_tensor.clone()
+        self.t_placeholder = timesteps.clone()
+        self.sde_args_placeholder = torch.tensor(
+            sde_args, device=input_tensor.device, dtype=input_tensor.dtype
+        )
+        self.sde_rnd_placeholder = sde_rnd.clone()
+
+        # (wenyao) Aborting CFM.sample during graph capture corrupts the
+        # partial graph. Pass abort_event=None during capture; the caller
+        # (execute) checks abort before initialize_graph and on every replay.
+        graph_backend = current_platform.get_device_graph_backend(input_tensor.device)
+        if graph_backend is None:
+            raise RuntimeError(
+                f"device graphs are unavailable for {input_tensor.device}"
+            )
+        else:
+            pass
+        try:
+            if current_platform.is_cuda():
+                runtime = TalkerDeviceRuntime(input_tensor.device)
+                runtime.synchronize()
+                with runtime.create_stream_context(runtime.create_stream()):
+                    # note (yzxiao): The full eager tail initializes JIT kernels
+                    # before capture, using the same static inputs and precision.
+                    for _ in range(2):
+                        self.compute_tail()
+                    runtime.synchronize()
+            else:
+                pass
+            with (
+                current_platform.graph_capture_attention(),
+                graph_backend.capture(thread_local_errors=True) as graph,
+            ):
+                self.graph = graph
+                (
+                    self.gen_lat_placeholder,
+                    self.inputs_embeds_placeholder,
+                    self.stop_out_placeholder,
+                ) = self.compute_tail()
+        except BaseException:
+            self.graph = None
+            self.gen_lat_placeholder = None
+            self.inputs_embeds_placeholder = None
+            self.stop_out_placeholder = None
+            raise
+
+        self.initialized = True
+
+    def compute_tail(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        gen_lat = self.cfm.sample(
+            self.last_hidden_state_placeholder,
+            self.his_lat_placeholder,
+            self.randn_like_placeholder,
+            self.t_placeholder,
+            self.sde_args_placeholder,
+            self.sde_rnd_placeholder,
+            abort_event=None,
+        )
+        inputs_embeds = self.aggregator(gen_lat)
+        stop_out = self.stop_head(self.last_hidden_state_placeholder[:, -1, :]).softmax(
+            dim=-1
+        )
+        return gen_lat, inputs_embeds, stop_out
+
+
+class CFMGraphExecutorPool:
+    def __init__(self, config, cfm, aggregator, stop_head, pool_size=5):
+        self.config = config
+        self.cfm = cfm
+        self.aggregator = aggregator
+        self.stop_head = stop_head
+        self.pool_size = pool_size
+        self.pool: Queue = Queue(maxsize=pool_size)
+        self.lock = Lock()
+        self.initialize_pool()
+
+    def initialize_pool(self):
+        for _ in range(self.pool_size):
+            self.pool.put(
+                CFMGraphExecutor(self.config, self.cfm, self.aggregator, self.stop_head)
+            )
+
+    def acquire(self):
+        return self.pool.get()
+
+    def release(self, executor):
+        if isinstance(executor, CFMGraphExecutor):
+            self.pool.put(executor)
+        else:
+            pass
+
+    def execute(
+        self,
+        input_tensor,
+        his_lat,
+        cfg_strength=2.0,
+        sigma=0.25,
+        temperature=0.0,
+        abort_event: threading.Event | None = None,
+    ):
+        executor = self.acquire()
+        try:
+            return executor.execute(
+                input_tensor, his_lat, cfg_strength, sigma, temperature, abort_event
+            )
+        finally:
+            self.release(executor)
+
+
+class MingOmniTalker(nn.Module):
+    """Ming-Omni talker model.
+
+    Submodules:
+    - model: Qwen2Model (dense LLM backbone, hidden=896)
+    - cfm: CFM(DiT) (flow matching, 28-layer DiT, hidden=1024)
+    - aggregator: Aggregator (28-layer transformer, hidden=1152)
+    - stop_head: nn.Linear(896, 2)
+    - spk_head: nn.Linear(192, 896)
+    """
+
+    def __init__(
+        self,
+        config: MingOmniTalkerConfig,
+        *,
+        dit_execution_config: TalkerExecutionConfig | None = None,
+        aggregator_execution_config: TalkerExecutionConfig | None = None,
+    ):
+        super().__init__()
+        self.config = config
+
+        # Qwen2 LLM backbone
+        self.model_config = Qwen2Config(**config.llm_config)
+        self.model = Qwen2Model(self.model_config)
+        self.model.config._attn_implementation = "sdpa"  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+
+        self.latent_dim = config.latent_dim
+        self.cfm = CFM(
+            DiT(
+                llm_cond_dim=self.model.config.hidden_size,
+                execution_config=dit_execution_config,
+                **config.flowmodel,
+            ),
+            steps=config.steps,
+        )
+        self.aggregator = Aggregator(
+            llm_input_dim=self.model.config.hidden_size,
+            execution_config=aggregator_execution_config,
+            **config.aggregator,
+        )
+        self.reference_patch_capacity = (
+            aggregator_execution_config.rope_max_batch_size
+            if aggregator_execution_config is not None
+            else None
+        )
+
+        self.stop_head = nn.Linear(self.model.config.hidden_size, 2, bias=True)
+        self.spk_head = nn.Linear(
+            config.spk_dim, self.model.config.hidden_size, bias=True
+        )
+
+        self.patch_size = config.patch_size
+        self.his_patch_size = config.history_patch_size
+
+        # --- External dependencies (set via setters) ---
+        self.tokenizer = None
+        self.normalizer: IdentityNormalizer | TalkerTN = IdentityNormalizer()
+        self.spkemb_extractor = None
+        self.voice_json_dict: dict = {}
+
+        # --- Internal state ---
+        self.lock = threading.Lock()
+        self.tts_speech_token_dict: dict[str, list[tuple[torch.Tensor, bool]]] = {}
+        self.llm_end_dict: dict[str, bool] = {}
+        self.vae_cache: dict = {}
+        self.sil_holder_cache: dict[str, dict[str, list[torch.Tensor]] | None] = {}
+
+        self.initialized = None
+        self.initial_lock = threading.Lock()
+        self.registered_prompt: dict = {}
+        self.max_conc = config.max_conc
+        self.executor = ThreadPoolExecutor(max_workers=self.max_conc)
+        self.sampler_pool = CFMGraphExecutorPool(
+            self.config,
+            self.cfm,
+            self.aggregator,
+            self.stop_head,
+            self.max_conc,
+        )
+        self.device_runtime: TalkerDeviceRuntime | None = None
+        self.model_graph_pool: queue.Queue = queue.Queue()
+        self.past_key_values = None
+        for _ in range(self.max_conc):
+            self.model_graph_pool.put((None, None, None, None, None))
+
+    @classmethod
+    def from_pretrained(
+        cls, model_path: str, *, device: str | torch.device
+    ) -> MingOmniTalker:
+        device = torch.device(device)
+        # 1. Load config from checkpoint
+        config = MingOmniTalkerConfig.from_pretrained_dir(model_path)
+        if device.type == "npu":
+            config.use_torch_attention()
+        else:
+            pass
+
+        dit_execution_config = None
+        aggregator_execution_config = None
+        use_cuda_kernels = device.type == "cuda" and current_platform.is_cuda()
+        if use_cuda_kernels:
+            from sglang_omni.vendor.sglang.layers import RMSNorm
+
+            rope_kernel = current_platform.get_joint_rope_inplace_kernel()
+            if rope_kernel is None:
+                raise RuntimeError(
+                    "Ming-Omni CUDA talker requires a joint in-place RoPE "
+                    f"kernel, but {type(current_platform).__name__} does not "
+                    "provide one."
+                )
+            else:
+                pass
+            norm_layer = partial(RMSNorm, cast_x_before_out_mul=True)
+            qkv_layer = PackedQKVLinear
+            # note (yzxiao): CFG doubles DiT batch; reference aggregation is
+            # capped by the 512-token AR cache's upper bound.
+            dit_execution_config = TalkerExecutionConfig(
+                rope_kernel=rope_kernel,
+                rope_seq_len=1 + config.history_patch_size + config.patch_size,
+                rope_max_batch_size=2,
+                norm_layer=norm_layer,
+                qkv_layer=qkv_layer,
+            )
+            aggregator_execution_config = TalkerExecutionConfig(
+                rope_kernel=rope_kernel,
+                rope_seq_len=1 + config.patch_size,
+                rope_max_batch_size=AR_CACHE_MAX_TOKENS,
+                norm_layer=norm_layer,
+                qkv_layer=qkv_layer,
+            )
+        else:
+            pass
+        # 2. Create model (no weights yet)
+        model = cls(
+            config,
+            dit_execution_config=dit_execution_config,
+            aggregator_execution_config=aggregator_execution_config,
+        )
+        # 3. Stream weights, then move to device with bf16
+        weights = load_weights_by_prefix(model_path, prefix="")
+        model.load_weights(weights.items())
+        model.to(device=device, dtype=torch.bfloat16).eval()
+        return model
+
+    # ---- External dependency setters ----
+
+    def set_tokenizer(self, tokenizer) -> None:
+        self.tokenizer = tokenizer
+
+    def set_normalizer(self, normalizer) -> None:
+        self.normalizer = normalizer
+
+    def set_voice_presets(self, voice_dict: dict) -> None:
+        self.voice_json_dict = voice_dict
+
+    def set_spkemb_extractor(self, extractor) -> None:
+        self.spkemb_extractor = extractor
+
+    # ---- Weight loading ----
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
+        params_dict = dict(self.named_parameters())
+        loaded: dict[str, set[str]] = {}
+        full_packed: set[str] = set()
+        required_shards = set(PACKED_QKV_SHARD_IDS)
+        for name, loaded_weight in weights:
+            packed_shard = load_packed_qkv_shard(name, loaded_weight, params_dict)
+            if packed_shard is not None:
+                target_name, shard_id = packed_shard
+                if target_name in full_packed:
+                    raise ValueError(f"Mixed full and split QKV weights: {target_name}")
+                else:
+                    pass
+                loaded.setdefault(target_name, set()).add(shard_id)
+                continue
+            else:
+                pass
+
+            if name not in params_dict:
+                logger.warning("Unexpected weight: %s", name)
+                continue
+            else:
+                pass
+            if ".to_qkv." in name:
+                if name in loaded:
+                    raise ValueError(f"Mixed full and split QKV weights: {name}")
+                else:
+                    pass
+                full_packed.add(name)
+                loaded[name] = required_shards.copy()
+            else:
+                loaded[name] = set()
+            default_weight_loader(params_dict[name], loaded_weight)
+
+        packed_params = {name for name in params_dict if ".to_qkv." in name}
+        missing_shards = {
+            name: sorted(required_shards - loaded.get(name, set()))
+            for name in packed_params
+            if loaded.get(name, set()) != required_shards
+        }
+        if missing_shards:
+            raise ValueError(f"Missing packed QKV shards: {missing_shards}")
+        else:
+            pass
+        missing = params_dict.keys() - loaded.keys()
+        if missing:
+            logger.warning(
+                "Missing weights (%d): %s", len(missing), sorted(missing)[:20]
+            )
+        else:
+            pass
+
+    # ---- Forward (not used directly) ----
+
+    def forward(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def get_input_embeddings(self):
+        return self.model.get_input_embeddings()
+
+    # ---- Device graph initialization ----
+
+    def initial_graph(self, tokenizer=None):
+        """Initialize device graphs for generation.
+
+        Args:
+            tokenizer: If provided, sets the model tokenizer before graph init.
+                       This is needed because the tokenizer must be available
+                       for ``omni_audio_generation_func``.
+        """
+        if tokenizer is not None:
+            self.tokenizer = tokenizer
+        else:
+            pass
+
+        with self.initial_lock:
+            if not self.initialized:
+                for _ in range(self.max_conc):
+                    this_uuid = str(uuid.uuid1())
+                    with self.lock:
+                        self.tts_speech_token_dict[this_uuid] = []
+                        self.llm_end_dict[this_uuid] = False
+                        self.vae_cache[this_uuid] = {
+                            "past_key_values": None,
+                            "stream_state": (None, None, None),
+                        }
+                        self.sil_holder_cache[this_uuid] = None
+
+                    prompt = (
+                        "Please generate speech based on the following description.\n"
+                    )
+                    text = "Initialize compilation graph"
+                    try:
+                        future = self.executor.submit(
+                            self.llm_job,
+                            prompt,
+                            text,
+                            None,
+                            None,
+                            "",
+                            None,
+                            None,
+                            this_uuid,
+                        )
+                        future.result()
+                    finally:
+                        with self.lock:
+                            self.tts_speech_token_dict.pop(this_uuid, None)
+                            self.llm_end_dict.pop(this_uuid, None)
+                            self.vae_cache.pop(this_uuid, None)
+                            self.sil_holder_cache.pop(this_uuid, None)
+
+                self.initialized = True
+            else:
+                pass
+
+    # ---- Generation ----
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    @property
+    def dtype(self):
+        return next(self.parameters()).dtype
+
+    def get_device_runtime(self) -> TalkerDeviceRuntime:
+        device_runtime = getattr(self, "device_runtime", None)
+        if device_runtime is None:
+            device_runtime = TalkerDeviceRuntime(self.device)
+            self.device_runtime = device_runtime
+        else:
+            pass
+        return device_runtime
+
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        prompt_wav_lat=None,
+        min_new_token=3,
+        cfg=2.0,
+        sigma=0.25,
+        temperature=0,
+        abort_event: threading.Event | None = None,
+        max_decode_steps: int | None = None,
+    ):
+        step = 0
+        target_dtype = torch.bfloat16
+        inputs_embeds = inputs_embeds.to(dtype=target_dtype)
+
+        his_lat = torch.zeros(
+            1,
+            self.his_patch_size,
+            self.latent_dim,
+            device=self.device,
+            dtype=target_dtype,
+        )
+        if prompt_wav_lat is not None:
+            prompt_wav_lat = prompt_wav_lat.to(dtype=target_dtype)
+            start_index = self.his_patch_size - prompt_wav_lat.size(1)
+            if start_index < 0:
+                his_lat[:] = prompt_wav_lat[:, -start_index:, :]
+            else:
+                his_lat[:, start_index:, :] = prompt_wav_lat
+        else:
+            pass
+
+        (
+            past_key_values,
+            inputs_embeds_placeholder,
+            cache_position_placeholder,
+            outputs_placeholder,
+            model_graph,
+        ) = self.model_graph_pool.get()
+
+        try:
+            if past_key_values is None:
+                past_key_values = StaticCache(
+                    config=self.model.config,
+                    max_batch_size=1,
+                    max_cache_len=AR_CACHE_MAX_TOKENS,
+                    device=self.model.device,
+                    dtype=target_dtype,
+                )
+            else:
+                if hasattr(past_key_values, "reset"):
+                    past_key_values.reset()
+                elif hasattr(past_key_values, "key_cache"):
+                    for layer_idx in range(len(past_key_values.key_cache)):
+                        past_key_values.key_cache[layer_idx].zero_()
+                        past_key_values.value_cache[layer_idx].zero_()
+                else:
+                    for layer in past_key_values.layers:
+                        layer.keys.zero_()
+                        layer.values.zero_()
+
+            prefill_len = inputs_embeds.shape[1]
+            attention_mask = torch.ones(input_ids.shape).to(input_ids.device)
+            position_ids = (attention_mask.cumsum(-1) - 1).masked_fill_(
+                (attention_mask == 0), 1
+            )
+
+            cache_max_decode_steps = (
+                AR_CACHE_MAX_TOKENS - prefill_len
+            ) // self.patch_size
+            if max_decode_steps is None:
+                effective_max_decode_steps = cache_max_decode_steps
+            else:
+                effective_max_decode_steps = min(
+                    cache_max_decode_steps, max_decode_steps
+                )
+
+            while step < 1000 and step < effective_max_decode_steps:
+                if abort_event is not None and abort_event.is_set():
+                    raise asyncio.CancelledError()
+                else:
+                    pass
+                if step == 0:
+                    prefill_cache_position = torch.arange(
+                        0, prefill_len, device=inputs_embeds.device
+                    )
+                    outputs = self.model(
+                        position_ids=position_ids,
+                        cache_position=prefill_cache_position,
+                        past_key_values=past_key_values,
+                        inputs_embeds=inputs_embeds,
+                        use_cache=True,
+                        output_hidden_states=True,
+                    )
+                else:
+                    past_seen_tokens = past_key_values.get_seq_length()
+                    if isinstance(past_seen_tokens, torch.Tensor):
+                        past_seen_tokens = int(past_seen_tokens.item())
+                    else:
+                        pass
+                    cache_position = torch.arange(
+                        past_seen_tokens,
+                        past_seen_tokens + inputs_embeds.shape[1],
+                        device=inputs_embeds.device,
+                    )
+
+                    if model_graph is None:
+                        graph_backend = current_platform.get_device_graph_backend(
+                            inputs_embeds.device
+                        )
+                        if graph_backend is None:
+                            raise RuntimeError(
+                                f"device graphs are unavailable for {inputs_embeds.device}"
+                            )
+                        else:
+                            pass
+                        inputs_embeds_placeholder = torch.empty_like(inputs_embeds)
+                        cache_position_placeholder = torch.empty_like(cache_position)
+
+                        inputs_embeds_placeholder.copy_(inputs_embeds)
+                        cache_position_placeholder.copy_(cache_position)
+
+                        with (
+                            current_platform.graph_capture_attention(),
+                            graph_backend.capture(
+                                thread_local_errors=True
+                            ) as model_graph,
+                        ):
+                            outputs_placeholder = self.model(
+                                position_ids=None,
+                                cache_position=cache_position_placeholder,
+                                attention_mask=None,
+                                past_key_values=past_key_values,
+                                inputs_embeds=inputs_embeds_placeholder,
+                                use_cache=True,
+                                output_hidden_states=True,
+                            )
+                    else:
+                        inputs_embeds_placeholder.copy_(inputs_embeds)
+                        if cache_position_placeholder is not None:
+                            cache_position_placeholder.copy_(cache_position)
+                        else:
+                            pass
+                        model_graph.replay()
+
+                    outputs = outputs_placeholder
+
+                hidden_out = outputs.hidden_states[-1][:, -1:, :]
+
+                gen_lat, inputs_embeds, stop_out = self.sampler_pool.execute(
+                    hidden_out,
+                    his_lat,
+                    cfg,
+                    sigma,
+                    temperature,
+                    abort_event,
+                )
+
+                if self.his_patch_size == self.patch_size:
+                    his_lat = gen_lat
+                elif self.his_patch_size > self.patch_size:
+                    his_lat = torch.cat(
+                        [his_lat[:, self.patch_size - self.his_patch_size :], gen_lat],
+                        dim=1,
+                    )
+                else:
+                    raise NotImplementedError
+
+                if abort_event is not None and abort_event.is_set():
+                    raise asyncio.CancelledError()
+                else:
+                    pass
+
+                is_stop = step > min_new_token and bool(stop_out.cpu()[0, 1] > 0.5)
+                last_chunk = (
+                    is_stop
+                    or step + 1 >= effective_max_decode_steps
+                    or step + 1 >= 1000
+                )
+                yield gen_lat, last_chunk
+                if last_chunk:
+                    break
+                else:
+                    pass
+                step += 1
+        finally:
+            self.model_graph_pool.put(
+                (
+                    past_key_values,
+                    inputs_embeds_placeholder,
+                    cache_position_placeholder,
+                    outputs_placeholder,
+                    model_graph,
+                )
+            )
+
+    def omni_audio_generation_func(
+        self,
+        prompt,
+        text,
+        spk_emb,
+        instruction,
+        prompt_text=None,
+        prompt_wav_lat=None,
+        prompt_wav_emb=None,
+        cfg=2.0,
+        sigma=0.25,
+        temperature=0,
+        abort_event: threading.Event | None = None,
+        max_decode_steps: int | None = None,
+    ):
+        assert (
+            self.tokenizer is not None
+        ), "Tokenizer not set. Call set_tokenizer() first."
+        tokenizer = self.tokenizer
+
+        spk_emb_prompt: list = []
+        if spk_emb is not None:
+            for i, se in enumerate(spk_emb):
+                spk_emb_prompt.extend(
+                    tokenizer.encode(f"  speaker_{i + 1}:")
+                    + tokenizer.encode("<|vision_start|>")
+                    + tokenizer.encode("<|vision_pad|>")
+                    + tokenizer.encode("<|vision_end|>\n")
+                )
+        else:
+            pass
+
+        instruction_prompt: list = []
+        if instruction is not None:
+            instruction_prompt = tokenizer.encode(instruction) + tokenizer.encode(
+                "<|im_end|>"
+            )
+        else:
+            pass
+
+        prompt_text_token: list = []
+        prompt_latent_token: list = []
+        if prompt_wav_emb is not None and prompt_text is not None:
+            prompt_text_token = tokenizer.encode(prompt_text)
+            prompt_latent_token = tokenizer.encode(
+                "<audioPatch>"
+            ) * prompt_wav_emb.size(1)
+        else:
+            pass
+
+        prompt2 = tokenizer.encode(" Text input:\n")
+        if (
+            "Genre: " in text
+            and "Mood: " in text
+            and "Instrument: " in text
+            and "Theme: " in text
+            and "Duration: " in text
+        ):
+            prompt2 = []
+        else:
+            pass
+
+        input_part = (
+            tokenizer.encode(
+                "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+            )
+            + tokenizer.encode("<|im_start|>user\n")
+            + tokenizer.encode(prompt)
+            + spk_emb_prompt
+            + prompt2
+            + prompt_text_token
+            + tokenizer.encode(text)
+            + tokenizer.encode("<|im_end|>\n")
+            + tokenizer.encode("<|im_start|>assistant\n")
+            + instruction_prompt
+            + tokenizer.encode("<audio>")
+            + prompt_latent_token
+        )
+
+        logger.info("Talker input: %r", tokenizer.decode(input_part)[:200])
+
+        input_ids = (
+            torch.tensor(input_part, dtype=torch.long).unsqueeze(0).to(self.device)
+        )
+        inputs_embeds = self.model.get_input_embeddings()(input_ids).to(
+            device=self.device,
+            dtype=torch.bfloat16,
+        )
+
+        if spk_emb is not None:
+            spk_token_id = tokenizer.encode("<|vision_start|>")
+            assert len(spk_token_id) == 1
+            spk_indices = torch.where(input_ids[0] == spk_token_id[0])[0]
+            assert len(spk_indices) > 0
+            for i, se in enumerate(spk_emb):
+                inputs_embeds[0, spk_indices[i] + 1] = se.to(dtype=torch.bfloat16)
+        else:
+            pass
+
+        if prompt_wav_emb is not None and prompt_text is not None:
+            audio_token_id = tokenizer.encode("<audio>")
+            assert len(audio_token_id) == 1
+            audio_indices = torch.where(input_ids[0] == audio_token_id[0])[0]
+            assert len(audio_indices) > 0
+            inputs_embeds[
+                0,
+                audio_indices[0] + 1 : audio_indices[0] + 1 + prompt_wav_emb.size(1),
+                :,
+            ] = prompt_wav_emb[0].to(dtype=torch.bfloat16)
+        else:
+            pass
+
+        with autocast_context(inputs_embeds):
+            for audio_token in self.generate(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                prompt_wav_lat=prompt_wav_lat,
+                cfg=cfg,
+                sigma=sigma,
+                temperature=temperature,
+                abort_event=abort_event,
+                max_decode_steps=max_decode_steps,
+            ):
+                yield audio_token
+
+    def token2wav(
+        self, audio_detokenizer, token, cache=None, stream=False, last_chunk=False
+    ):
+        speech, stream_state, past_key_values = audio_detokenizer.decode(
+            torch.cat(token, dim=1),
+            use_cache=stream,
+            **cache,
+            last_chunk=last_chunk,
+        )
+        new_cache = {"past_key_values": past_key_values, "stream_state": stream_state}
+        return speech[0].detach().float(), new_cache
+
+    @staticmethod
+    def silence_holder(
+        speech, sample_rate, sil_cache=None, last_chunk=True, sil_th=1e-3, last_sil=0.3
+    ):
+        if speech.numel() == 0:
+            assert not last_chunk
+            return speech, sil_cache
+        else:
+            pass
+
+        frame_step, frame_size = int(sample_rate * 0.1), int(sample_rate * 0.1)
+        if sil_cache is None:
+            sil_cache = {"holder": [], "buffer": []}
+        else:
+            pass
+        if sil_cache["buffer"]:
+            speech = torch.cat([*sil_cache["buffer"], speech], dim=-1)
+            sil_cache["buffer"] = []
+        else:
+            pass
+        if last_chunk:
+            tail_len = speech.shape[-1] % frame_size
+            # Score the real tail samples before an all-silence branch can
+            # truncate them. Earlier silence is not trailing if this tail speaks.
+            if tail_len and speech[..., -tail_len:].abs().mean() > sil_th:
+                speech = torch.cat([*sil_cache["holder"], speech], dim=-1)
+                sil_cache["holder"] = []
+                return speech, sil_cache
+            else:
+                pass
+        else:
+            pass
+        if speech.shape[-1] < frame_size:
+            sil_cache["buffer"].append(speech)
+            if last_chunk:
+                speech = torch.cat(sil_cache["holder"] + sil_cache["buffer"], dim=-1)
+                return speech[..., : int(last_sil * sample_rate)], sil_cache
+            else:
+                pass
+            return (
+                torch.zeros(
+                    (*speech.shape[:-1], 0), device=speech.device, dtype=speech.dtype
+                ),
+                sil_cache,
+            )
+        else:
+            pass
+
+        num_frame = (speech.shape[-1] - frame_size) // frame_step + 1
+        cur_len = (num_frame - 1) * frame_step + frame_size
+        if speech.shape[-1] > cur_len:
+            sil_cache["buffer"].append(speech[..., cur_len:])
+            speech = speech[..., :cur_len]
+        else:
+            pass
+        spe_frames = speech.unfold(-1, frame_size, frame_step)
+        scores = spe_frames.abs().mean(dim=-1)
+        scores = scores.mean(dim=list(range(scores.dim() - 1)))
+        idx = scores.shape[0] - 1
+        while idx >= 0:
+            if scores[idx] > sil_th:
+                break
+            else:
+                pass
+            idx -= 1
+        if idx < 0:
+            sil_cache["holder"].append(speech)
+            if last_chunk:
+                speech = torch.cat(sil_cache["holder"] + sil_cache["buffer"], dim=-1)
+                return speech[..., : int(last_sil * sample_rate)], sil_cache
+            else:
+                pass
+            return (
+                torch.zeros(
+                    (*speech.shape[:-1], 0), device=speech.device, dtype=speech.dtype
+                ),
+                sil_cache,
+            )
+        else:
+            pass
+        if last_chunk and sil_cache["buffer"]:
+            speech = torch.cat([speech, *sil_cache["buffer"]], dim=-1)
+            sil_cache["buffer"] = []
+        else:
+            pass
+        non_sil_len = idx * frame_step + frame_size
+        if last_chunk:
+            non_sil_len += int(last_sil * sample_rate)
+        else:
+            pass
+        current_speech = speech
+        current_output = current_speech[..., :non_sil_len]
+        current_tail = current_speech[..., non_sil_len:]
+        speech = torch.cat([*sil_cache["holder"], current_output], dim=-1)
+        sil_cache["holder"] = []
+        if current_tail.shape[-1] > 0:
+            sil_cache["holder"].append(current_tail)
+        else:
+            pass
+        return speech, sil_cache
+
+    def llm_job(
+        self,
+        prompt,
+        text,
+        spk_emb,
+        instruction,
+        prompt_text,
+        prompt_wav_lat,
+        prompt_wav_emb,
+        this_uuid,
+        cfg=2.0,
+        sigma=0.25,
+        temperature=0,
+        token_queue: queue.Queue | None = None,
+        abort_event: threading.Event | None = None,
+        max_decode_steps: int | None = None,
+    ):
+        try:
+            device_runtime = self.get_device_runtime()
+            with device_runtime.create_stream_context(device_runtime.create_stream()):
+                for audio_token in self.omni_audio_generation_func(
+                    prompt=prompt,
+                    text=text,
+                    spk_emb=spk_emb,
+                    instruction=instruction,
+                    prompt_text=prompt_text,
+                    prompt_wav_lat=prompt_wav_lat,
+                    prompt_wav_emb=prompt_wav_emb,
+                    cfg=cfg,
+                    sigma=sigma,
+                    temperature=temperature,
+                    abort_event=abort_event,
+                    max_decode_steps=max_decode_steps,
+                ):
+                    if abort_event is not None and abort_event.is_set():
+                        raise asyncio.CancelledError()
+                    else:
+                        pass
+                    device_runtime.synchronize()
+                    if token_queue is not None:
+                        token_queue.put(audio_token)
+                    else:
+                        self.tts_speech_token_dict[this_uuid].append(audio_token)
+        finally:
+            with self.lock:
+                if this_uuid in self.llm_end_dict:
+                    self.llm_end_dict[this_uuid] = True
+                else:
+                    pass
+            if token_queue is not None:
+                token_queue.put(_TOKEN_DONE)
+            else:
+                pass
+
+    def tts_job(
+        self,
+        prompt,
+        text,
+        spk_emb,
+        instruction,
+        audio_detokenizer,
+        prompt_text,
+        prompt_wav_lat,
+        prompt_wav_emb,
+        stream,
+        cfg=2.0,
+        sigma=0.25,
+        temperature=0,
+        abort_event: threading.Event | None = None,
+        max_decode_steps: int | None = None,
+    ):
+        device_runtime = self.get_device_runtime()
+        with device_runtime.create_stream_context(device_runtime.create_stream()):
+            this_uuid = str(uuid.uuid1())
+            token_queue = queue.Queue() if stream else None
+            effective_abort_event = abort_event
+            if stream and effective_abort_event is None:
+                effective_abort_event = threading.Event()
+            else:
+                pass
+            completed = False
+            future = None
+            with self.lock:
+                self.tts_speech_token_dict[this_uuid] = []
+                self.llm_end_dict[this_uuid] = False
+                self.vae_cache[this_uuid] = {
+                    "past_key_values": None,
+                    "stream_state": (None, None, None),
+                }
+                self.sil_holder_cache[this_uuid] = None
+
+            try:
+                future = self.executor.submit(
+                    self.llm_job,
+                    prompt,
+                    text,
+                    spk_emb,
+                    instruction,
+                    prompt_text,
+                    prompt_wav_lat,
+                    prompt_wav_emb,
+                    this_uuid,
+                    cfg,
+                    sigma,
+                    temperature,
+                    token_queue=token_queue,
+                    abort_event=effective_abort_event,
+                    max_decode_steps=max_decode_steps,
+                )
+
+                if stream:
+                    assert token_queue is not None
+                    # 25ms wakeup keeps the abort_event check responsive when
+                    # llm_job has not yet pushed a token or _TOKEN_DONE.
+                    # Worst-case external abort latency is bounded by this poll
+                    # interval plus one inner generator step.
+                    while True:
+                        if (
+                            effective_abort_event is not None
+                            and effective_abort_event.is_set()
+                        ):
+                            raise asyncio.CancelledError()
+                        else:
+                            pass
+                        if future.done():
+                            exc = future.exception()
+                            if exc:
+                                raise exc
+                            else:
+                                pass
+                        else:
+                            pass
+                        try:
+                            queue_item = token_queue.get(timeout=0.025)
+                        except queue.Empty:
+                            continue
+                        if queue_item is _TOKEN_DONE:
+                            future.result()
+                            completed = True
+                            break
+                        else:
+                            pass
+                        last_chunk = queue_item[-1]
+                        this_tts_speech_token = [queue_item[0]]
+                        this_tts_speech, self.vae_cache[this_uuid] = self.token2wav(
+                            audio_detokenizer=audio_detokenizer,
+                            token=this_tts_speech_token,
+                            cache=self.vae_cache[this_uuid],
+                            stream=True,
+                            last_chunk=last_chunk,
+                        )
+                        (
+                            this_tts_speech,
+                            self.sil_holder_cache[this_uuid],
+                        ) = self.silence_holder(
+                            this_tts_speech,
+                            audio_detokenizer.config.sample_rate,
+                            self.sil_holder_cache[this_uuid],
+                            last_chunk,
+                        )
+                        if this_tts_speech.numel() > 0:
+                            yield {"tts_speech": this_tts_speech.cpu()}
+                        else:
+                            pass
+                else:
+                    future.result()
+                    this_tts_speech_token = self.tts_speech_token_dict[this_uuid]
+                    this_tts_speech_token = [ii[0] for ii in this_tts_speech_token]
+                    this_tts_speech, self.vae_cache[this_uuid] = self.token2wav(
+                        audio_detokenizer=audio_detokenizer,
+                        token=this_tts_speech_token,
+                        cache=self.vae_cache[this_uuid],
+                        stream=False,
+                        last_chunk=True,
+                    )
+                    (
+                        this_tts_speech,
+                        self.sil_holder_cache[this_uuid],
+                    ) = self.silence_holder(
+                        this_tts_speech,
+                        audio_detokenizer.config.sample_rate,
+                        self.sil_holder_cache[this_uuid],
+                        True,
+                    )
+                    yield {"tts_speech": this_tts_speech.cpu()}
+                    completed = True
+
+                device_runtime.synchronize()
+            finally:
+                if stream and not completed:
+                    if effective_abort_event is not None:
+                        effective_abort_event.set()
+                    else:
+                        pass
+                    if future is not None:
+                        cancelled = future.cancel()
+                        if not cancelled:
+                            try:
+                                future.result()
+                            except (asyncio.CancelledError, FutureCancelledError):
+                                pass
+                        else:
+                            pass
+                    else:
+                        pass
+                else:
+                    pass
+                with self.lock:
+                    self.tts_speech_token_dict.pop(this_uuid, None)
+                    self.llm_end_dict.pop(this_uuid, None)
+                    self.vae_cache.pop(this_uuid, None)
+                    self.sil_holder_cache.pop(this_uuid, None)
+
+    def register_prompt_wav(self, prompt_wav_path, audio_detokenizer):
+        if isinstance(prompt_wav_path, str):
+            prompt_wav_path = [prompt_wav_path]
+        else:
+            pass
+
+        speech_parts = []
+        spk_emb_list = []
+        for x in prompt_wav_path:
+            speech_tmp, sample_rate = torchaudio.load(x, backend="soundfile")
+            speech_tmp1 = speech_tmp.clone()
+            if sample_rate != audio_detokenizer.config.sample_rate:
+                speech_tmp = torchaudio.transforms.Resample(
+                    sample_rate, audio_detokenizer.config.sample_rate
+                )(speech_tmp)
+            else:
+                pass
+            speech_parts.append(speech_tmp)
+
+            if self.spkemb_extractor is not None:
+                if sample_rate != 16000:
+                    speech_tmp1 = torchaudio.transforms.Resample(
+                        orig_freq=sample_rate, new_freq=16000
+                    )(speech_tmp1)
+                else:
+                    pass
+                se = self.spkemb_extractor(speech_tmp1)
+                se = self.spk_head(se.to(device=self.device, dtype=self.dtype))
+                spk_emb_list.append(se)
+            else:
+                pass
+
+        speech = torch.cat(speech_parts, dim=-1)
+
+        patch_pt = (
+            audio_detokenizer.encoder.hop_size
+            * max(1, audio_detokenizer.encoder.patch_size)
+            * self.patch_size
+        )
+        if speech.shape[-1] % patch_pt != 0:
+            pad_len = (speech.shape[1] + patch_pt - 1) // patch_pt * patch_pt
+            pad_speech = torch.zeros(
+                (speech.shape[0], pad_len), dtype=speech.dtype, device=speech.device
+            )
+            pad_speech[:, -speech.shape[1] :] = speech
+            speech = pad_speech
+        else:
+            pass
+        prompt_wav_lat, _ = audio_detokenizer.encode_latent(
+            speech.to(dtype=torch.bfloat16, device=self.device),
+            torch.tensor([speech.size(1)], dtype=torch.long, device=self.device),
+        )
+        assert prompt_wav_lat.shape[1] % self.patch_size == 0
+        reference_patch_count = prompt_wav_lat.shape[1] // self.patch_size
+        if (
+            self.reference_patch_capacity is not None
+            and reference_patch_count > self.reference_patch_capacity
+        ):
+            raise ValueError(
+                f"Reference audio has {reference_patch_count} patches; "
+                f"the acoustic kernel supports at most {self.reference_patch_capacity}."
+            )
+        else:
+            pass
+        prompt_wav_lat = prompt_wav_lat.reshape(
+            -1, self.patch_size, prompt_wav_lat.shape[-1]
+        )
+        prompt_wav_emb = self.aggregator(prompt_wav_lat)
+        prompt_wav_lat = prompt_wav_lat.reshape(1, -1, prompt_wav_lat.shape[-1])
+        prompt_wav_emb = prompt_wav_emb.reshape(1, -1, prompt_wav_emb.shape[-1])
+
+        key = (
+            "|".join(prompt_wav_path)
+            if len(prompt_wav_path) > 1
+            else prompt_wav_path[0]
+        )
+        self.registered_prompt[key] = {
+            "prompt_wav_lat": prompt_wav_lat,
+            "prompt_wav_emb": prompt_wav_emb,
+            "spk_emb": spk_emb_list if spk_emb_list else None,
+        }
+        logger.info("register_prompt_wav: %s", key)
+
+    def duration_capped_steps(
+        self,
+        text_len: int,
+        audio_detokenizer,
+        requested_max_steps: int,
+    ) -> int:
+        """Cap CFM decode steps by an audio-duration heuristic from the
+        Ming reference inference: up to ~0.36s/char with a 2.0s floor.
+        """
+        if audio_detokenizer is None:
+            return requested_max_steps
+        else:
+            pass
+        try:
+            sample_rate = float(audio_detokenizer.config.sample_rate)
+            vae_patch_size = float(getattr(audio_detokenizer.encoder, "patch_size", 1))
+            hop_size = float(audio_detokenizer.encoder.hop_size)
+        except AttributeError:
+            return requested_max_steps
+        seconds_per_step = (
+            float(self.patch_size) * vae_patch_size * hop_size
+        ) / sample_rate
+        if seconds_per_step <= 0:
+            return requested_max_steps
+        else:
+            pass
+        max_duration_s = max(2.0, float(text_len) * (5818.0 / 16000.0))
+        max_steps_by_duration = max(1, int(max_duration_s / seconds_per_step))
+        return min(requested_max_steps, max_steps_by_duration)
+
+    def get_prompt_emb(
+        self,
+        prompt_wav_path,
+        audio_detokenizer,
+        use_spk_emb=False,
+        use_zero_spk_emb=False,
+    ):
+        if prompt_wav_path is None:
+            if not use_zero_spk_emb:
+                return None, None, None
+            else:
+                pass
+            return (
+                None,
+                None,
+                torch.zeros(
+                    1,
+                    self.model.config.hidden_size,
+                    device=self.device,
+                    dtype=self.dtype,
+                ),
+            )
+        else:
+            pass
+        if isinstance(prompt_wav_path, list):
+            key = "|".join(prompt_wav_path)
+        else:
+            key = prompt_wav_path
+        if key not in self.registered_prompt:
+            self.register_prompt_wav(prompt_wav_path, audio_detokenizer)
+        else:
+            pass
+        msg = self.registered_prompt[key]
+        spk_emb = msg["spk_emb"] if use_spk_emb else None
+        return msg["prompt_wav_lat"], msg["prompt_wav_emb"], spk_emb
+
+    def run_tts_segments(
+        self,
+        text,
+        prompt,
+        instruction,
+        spk_emb,
+        audio_detokenizer,
+        prompt_text,
+        prompt_wav_lat,
+        prompt_wav_emb,
+        stream,
+        max_length=50,
+        abort_event: threading.Event | None = None,
+    ):
+        count = 0
+        cache_position: dict = {}
+        wds_lg_zh = 6.07
+        wds_lg_en = 16
+        streaming_text: list = []
+
+        tts_text_list = tokenize_mixed_text_iterator(text)
+
+        for i, ele in enumerate(tts_text_list):
+            if len(ele) == 0:
+                continue
+            else:
+                pass
+
+            should_process = False
+            if ele[-1] in "\uff01\uff1f\u3002\uff0c!?" and (
+                len(streaming_text) >= 12 or (count > 0 and len(streaming_text) >= 8)
+            ):
+                should_process = True
+                streaming_text.append(ele)
+            elif (
+                ele[-1] == "."
+                and (
+                    len(streaming_text) >= 12
+                    or (count > 0 and len(streaming_text) >= 8)
+                )
+                and not bool(
+                    re.search(
+                        r"[0-9]", streaming_text[-1][-1] if streaming_text else ""
+                    )
+                )
+            ):
+                should_process = True
+                streaming_text.append(ele)
+            elif ele[-1] == "\n":
+                if len(streaming_text) > 0:
+                    if bool(re.search(r"[\u4e00-\u9fff]", "".join(streaming_text))):
+                        if bool(re.search(r"[\u4e00-\u9fff]", streaming_text[-1][-1])):
+                            ele = "\uff0c"
+                            streaming_text.append(ele)
+                        else:
+                            pass
+                    else:
+                        if len(ele) > 1 and bool(re.search(r"[a-zA-Z]", ele[-2])):
+                            ele = ele[:-1] + "."
+                        else:
+                            ele = ele[:-1]
+                        streaming_text.append(ele)
+                else:
+                    pass
+                if len(streaming_text) >= 12 or (
+                    count > 0 and len(streaming_text) >= 8
+                ):
+                    should_process = True
+                else:
+                    pass
+            else:
+                streaming_text.append(ele)
+                continue
+
+            if should_process:
+                yield from self.process_segment(
+                    "".join(streaming_text),
+                    prompt,
+                    instruction,
+                    spk_emb,
+                    audio_detokenizer,
+                    prompt_text,
+                    prompt_wav_lat,
+                    prompt_wav_emb,
+                    stream,
+                    count,
+                    cache_position,
+                    max_length,
+                    wds_lg_zh,
+                    wds_lg_en,
+                    abort_event,
+                )
+                count += 1
+                streaming_text = []
+            else:
+                pass
+
+        if streaming_text and re.search(
+            r"[a-zA-Z\u4e00-\u9fff1-9]", "".join(streaming_text)
+        ):
+            yield from self.process_segment(
+                "".join(streaming_text),
+                prompt,
+                instruction,
+                spk_emb,
+                audio_detokenizer,
+                prompt_text,
+                prompt_wav_lat,
+                prompt_wav_emb,
+                stream,
+                count,
+                cache_position,
+                max_length,
+                wds_lg_zh,
+                wds_lg_en,
+                abort_event,
+            )
+        else:
+            pass
+
+    def process_segment(
+        self,
+        streaming_text,
+        prompt,
+        instruction,
+        spk_emb,
+        audio_detokenizer,
+        prompt_text,
+        prompt_wav_lat,
+        prompt_wav_emb,
+        stream,
+        count,
+        cache_position,
+        max_length,
+        wds_lg_zh,
+        wds_lg_en,
+        abort_event: threading.Event | None = None,
+    ):
+        sub_output_dict = cut_text_by_semantic_length(streaming_text, max_length)
+        text_list = sub_output_dict["fragments"]
+        if not text_list:
+            return
+        else:
+            pass
+
+        for text_ori in text_list:
+            length = len(text_ori)
+            previous_segment_items = [
+                (key, position)
+                for key, position in cache_position.items()
+                if isinstance(key, int)
+            ]
+            segment_key = (
+                max(key for key, _ in previous_segment_items) + 1
+                if previous_segment_items
+                else 0
+            )
+            if not previous_segment_items:
+                segment_start_idx = 0
+            else:
+                segment_start_idx = (
+                    max(position[1] for _, position in previous_segment_items) + 1
+                )
+            segment_end_idx = segment_start_idx + length - 1
+            cache_position.update({segment_key: (segment_start_idx, segment_end_idx)})
+
+            if not is_chinese(text_ori):
+                text = normalize_numbers(text_ori)
+                wds_lg = wds_lg_en
+            else:
+                text = text_ori
+                wds_lg = wds_lg_zh
+
+            text = self.normalizer.normalize(text)
+            if text and text[0] == "\uff0c":
+                text = text[1:]
+            else:
+                pass
+
+            use_stream = stream
+            total_samples = 0
+            next_start_idx = segment_start_idx
+
+            segment_max_decode_steps = self.duration_capped_steps(
+                text_len=len(text),
+                audio_detokenizer=audio_detokenizer,
+                requested_max_steps=1000,
+            )
+
+            for idx, this_tts_speech_dict in enumerate(
+                self.tts_job(
+                    prompt=prompt,
+                    text=text,
+                    spk_emb=spk_emb,
+                    instruction=instruction,
+                    audio_detokenizer=audio_detokenizer,
+                    prompt_text=prompt_text,
+                    prompt_wav_lat=prompt_wav_lat,
+                    prompt_wav_emb=prompt_wav_emb,
+                    stream=use_stream,
+                    abort_event=abort_event,
+                    max_decode_steps=segment_max_decode_steps,
+                )
+            ):
+                tts_speech = this_tts_speech_dict["tts_speech"]
+                if (
+                    total_samples
+                    and total_samples
+                    / audio_detokenizer.config.sample_rate
+                    * (16000 / 5818)
+                    >= len(text)
+                    and total_samples / audio_detokenizer.config.sample_rate > 2
+                ):
+                    break
+                else:
+                    pass
+
+                this_dura = float(
+                    tts_speech.shape[-1] / audio_detokenizer.config.sample_rate
+                )
+                if use_stream:
+                    this_start_idx = min(next_start_idx, segment_end_idx)
+                    this_end_idx = (
+                        min(
+                            math.ceil(this_dura * wds_lg) + this_start_idx,
+                            segment_end_idx + 1,
+                        )
+                        - 1
+                    )
+                    next_start_idx = this_end_idx + 1
+                    cache_position.update(
+                        {f"{segment_key}_{idx}": (this_start_idx, this_end_idx)}
+                    )
+                    rel_start_idx = this_start_idx - segment_start_idx
+                    rel_end_idx = this_end_idx - segment_start_idx
+                    this_text_ori = (
+                        ""
+                        if this_start_idx == this_end_idx
+                        else text_ori[rel_start_idx : rel_end_idx + 1]
+                    )
+                    total_samples += tts_speech.shape[-1]
+                    yield (
+                        tts_speech,
+                        this_text_ori,
+                        cache_position[f"{segment_key}_{idx}"],
+                        this_dura * 1000,
+                    )
+                else:
+                    total_samples += tts_speech.shape[-1]
+                    yield (
+                        tts_speech,
+                        text_ori,
+                        cache_position[segment_key],
+                        this_dura * 1000,
+                    )
+
+    def omni_audio_generation(
+        self,
+        tts_text,
+        voice_name="DB30",
+        prompt_text=None,
+        prompt_wav_path=None,
+        max_length=50,
+        audio_detokenizer=None,
+        stream=False,
+        **kwargs,
+    ):
+        text = tts_text
+        prompt = "Please generate speech based on the following description.\n"
+        instruction = None
+        abort_event = kwargs.get("abort_event")
+
+        # Resolve before creating a device stream so bad requests fail fast
+        # without holding device resources.
+        if prompt_wav_path is not None:
+            pass
+        elif voice_name is not None and voice_name in self.voice_json_dict:
+            prompt_text = self.voice_json_dict[voice_name]["prompt_text"]
+            prompt_wav_path = self.voice_json_dict[voice_name]["prompt_wav_path"]
+        elif voice_name is not None:
+            raise ValueError(
+                f"voice_name={voice_name!r} not found in loaded voice presets "
+                f"(available: {sorted(self.voice_json_dict)}). Without a preset "
+                f"or explicit prompt_wav_path the talker would run without a "
+                f"speaker anchor and produce drifting voice output. Either "
+                f"install talker/data/voice_name.json with this voice or pass "
+                f"prompt_wav_path explicitly."
+            )
+        else:
+            raise ValueError(
+                "omni_audio_generation requires either voice_name (resolved via "
+                "loaded voice presets) or prompt_wav_path. Both are None."
+            )
+
+        device_runtime = self.get_device_runtime()
+        with device_runtime.create_stream_context(device_runtime.create_stream()):
+            self.initial_graph()
+
+            prompt_wav_lat, prompt_wav_emb, spk_emb = self.get_prompt_emb(
+                prompt_wav_path,
+                audio_detokenizer,
+                use_spk_emb=True,
+                use_zero_spk_emb=False,
+            )
+
+            yield from self.run_tts_segments(
+                text,
+                prompt,
+                instruction,
+                spk_emb,
+                audio_detokenizer,
+                prompt_text,
+                prompt_wav_lat,
+                prompt_wav_emb,
+                stream=stream,
+                max_length=max_length,
+                abort_event=abort_event if stream else None,
+            )
+
+    def instruct_audio_generation(
+        self,
+        prompt,
+        text,
+        use_spk_emb=False,
+        use_zero_spk_emb=False,
+        instruction=None,
+        prompt_wav_path=None,
+        prompt_text=None,
+        max_decode_steps=200,
+        cfg=2.0,
+        sigma=0.25,
+        temperature=0,
+        max_length=50,
+        audio_detokenizer=None,
+        stream=False,
+        taskname="TTS",
+        **kwargs,
+    ):
+        abort_event = kwargs.get("abort_event")
+        device_runtime = self.get_device_runtime()
+        with device_runtime.create_stream_context(device_runtime.create_stream()):
+            self.initial_graph()
+
+            prompt_wav_lat, prompt_wav_emb, spk_emb = self.get_prompt_emb(
+                prompt_wav_path,
+                audio_detokenizer,
+                use_spk_emb=use_spk_emb,
+                use_zero_spk_emb=use_zero_spk_emb,
+            )
+
+            if taskname in [
+                "TTA",
+                "BGM",
+                "STYLE",
+                "SPEECH_BGM",
+                "SPEECH_SOUND",
+                "PODCAST",
+            ]:
+                non_segmented_max_decode_steps = self.duration_capped_steps(
+                    text_len=len(text),
+                    audio_detokenizer=audio_detokenizer,
+                    requested_max_steps=1000,
+                )
+                for this_tts_speech_dict in self.tts_job(
+                    prompt=prompt,
+                    text=text,
+                    spk_emb=spk_emb,
+                    instruction=instruction,
+                    audio_detokenizer=audio_detokenizer,
+                    prompt_text=prompt_text,
+                    prompt_wav_lat=prompt_wav_lat,
+                    prompt_wav_emb=prompt_wav_emb,
+                    stream=stream,
+                    cfg=cfg,
+                    sigma=sigma,
+                    temperature=temperature,
+                    abort_event=abort_event if stream else None,
+                    max_decode_steps=non_segmented_max_decode_steps,
+                ):
+                    yield this_tts_speech_dict["tts_speech"], None, None, None
+            else:
+                yield from self.run_tts_segments(
+                    text,
+                    prompt,
+                    instruction,
+                    spk_emb,
+                    audio_detokenizer,
+                    prompt_text,
+                    prompt_wav_lat,
+                    prompt_wav_emb,
+                    stream=stream,
+                    max_length=max_length,
+                    abort_event=abort_event if stream else None,
+                )

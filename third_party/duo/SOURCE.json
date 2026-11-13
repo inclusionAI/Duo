@@ -1,0 +1,5 @@
+{
+  "repository": "https://github.com/inclusionAI/Duo",
+  "branch": "inference/sglang-omni-duo",
+  "bundled": true
+}

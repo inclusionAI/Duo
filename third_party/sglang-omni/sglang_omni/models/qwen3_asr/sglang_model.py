@@ -1,0 +1,477 @@
+"""Qwen3-ASR model compatible with HuggingFace weights"""
+
+import logging
+from types import MethodType
+from typing import Iterable, List, Optional, Tuple
+
+import torch
+import torch.nn as nn
+from sglang.srt.configs.qwen3_omni import Qwen3OmniMoeAudioEncoderConfig
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.managers.mm_utils import (
+    MultiModalityDataPaddingPatternMultimodalTokens,
+    general_mm_embed_routine,
+)
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.qwen3 import Qwen3Attention, Qwen3ForCausalLM
+from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeAudioEncoder
+from sglang.srt.utils import add_prefix
+
+from sglang_omni.models.qwen3_asr.encoder_npu_graph import Qwen3ASREncoderNpuGraphRunner
+from sglang_omni.platforms import current_platform
+from sglang_omni.utils.hf import use_text_rope
+
+from .configuration_qwen3_asr import Qwen3ASRConfig
+from .encoder_cuda_graph import (
+    Qwen3ASREncoderLayerStackGraphRunner,
+    build_buckets,
+    eager_preamble,
+    plan_mel_chunks,
+    planned_preamble,
+    window_lens_from_token_counts,
+)
+
+logger = logging.getLogger(__name__)
+fused_qk_norm_rope = current_platform.get_fused_qk_norm_rope()
+
+
+def fused_asr_forward_prepare_native(
+    attention: Qwen3Attention,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if hidden_states.dtype != torch.bfloat16 or fused_qk_norm_rope is None:
+        return attention._asr_unfused_forward_prepare_native(  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+            positions,
+            hidden_states,
+        )
+    else:
+        pass
+    if positions.dtype != torch.int32:
+        # note(ratish): the prefill CUDA graph bypasses forward()'s int32
+        # cast; the kernel rejects int64 positions.
+        positions = positions.to(torch.int32)
+    else:
+        pass
+    qkv, _ = attention.qkv_proj(hidden_states)
+    fused_qk_norm_rope(
+        qkv,
+        attention.num_heads,
+        attention.num_kv_heads,
+        attention.num_kv_heads,
+        attention.head_dim,
+        attention.q_norm.variance_epsilon,
+        attention.q_norm.weight,
+        attention.k_norm.weight,
+        attention.rope_theta,
+        attention.rotary_emb.is_neox_style,
+        positions,
+        1.0,
+        0,
+        0,
+        1.0,
+    )
+    return qkv.split(
+        [attention.q_size, attention.kv_size, attention.kv_size],
+        dim=-1,
+    )
+
+
+def enable_fused_asr_qk_norm_rope(language_model: nn.Module) -> None:
+    # note (luojiaxuan): the sgl-kernel op operates in place on packed QKV and
+    # replaces split + two RMSNorm launches + RoPE for the equivalent text
+    # positions. Keep the original bound method for non-bfloat16 fallbacks.
+    if fused_qk_norm_rope is None:
+        return
+    else:
+        pass
+
+    for layer in language_model.model.layers:
+        attention = layer.self_attn
+        if attention.head_dim not in (64, 128, 256):
+            continue
+        else:
+            pass
+        attention._asr_unfused_forward_prepare_native = (
+            attention.forward_prepare_native
+        )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+        attention.forward_prepare_native = MethodType(
+            fused_asr_forward_prepare_native,
+            attention,
+        )
+
+
+class Qwen3ASRForConditionalGeneration(nn.Module):
+    default_bitsandbytes_target_modules = [
+        ".gate_proj.",
+        ".down_proj.",
+        ".up_proj.",
+        ".q_proj.",
+        ".k_proj.",
+        ".v_proj.",
+        ".o_proj.",
+    ]
+    bitsandbytes_stacked_params_mapping = {
+        "q_proj": ("qkv_proj", 0),
+        "k_proj": ("qkv_proj", 1),
+        "v_proj": ("qkv_proj", 2),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+    }
+
+    def __init__(
+        self,
+        config: Qwen3ASRConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.config = config
+        thinker_config = config.thinker_config
+
+        if getattr(thinker_config, "audio_config", None) is None:
+            thinker_config.audio_config = Qwen3OmniMoeAudioEncoderConfig()
+        else:
+            pass
+
+        # note (luojiaxuan): ASR has no spatial axes: all three MRoPE position
+        # rows are identical, so ordinary text RoPE is numerically equivalent and
+        # avoids the multimodal permutation/copy path on every decoder layer.
+        use_text_rope(thinker_config.text_config)
+
+        self.audio_tower = Qwen3OmniMoeAudioEncoder(thinker_config.audio_config)
+        self.language_model = Qwen3ForCausalLM(
+            thinker_config.text_config,
+            quant_config,
+            prefix=add_prefix("language_model", prefix),
+        )
+        enable_fused_asr_qk_norm_rope(self.language_model)
+        self.pattern = MultiModalityDataPaddingPatternMultimodalTokens()
+        self.encoder_graph_runner: Qwen3ASREncoderLayerStackGraphRunner | None = None
+
+    def init_encoder_graphs(
+        self, *, max_batch_size: int, max_tokens_per_clip: int
+    ) -> None:
+        device = next(self.audio_tower.parameters()).device
+        graph_backend = current_platform.get_device_graph_backend(device)
+        if graph_backend is None:
+            return
+        else:
+            pass
+        if device.type == "npu":
+            runner_cls = Qwen3ASREncoderNpuGraphRunner
+        else:
+            runner_cls = Qwen3ASREncoderLayerStackGraphRunner
+        runner = runner_cls(
+            self.audio_tower,
+            buckets=build_buckets(max_batch_size, max_tokens_per_clip),
+            max_batch_size=max_batch_size,
+            graph_backend=graph_backend,
+        )
+        runner.capture_all()
+        self.encoder_graph_runner = runner
+
+    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+        return self.pattern.pad_input_tokens(input_ids, mm_inputs)
+
+    def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        device = next(self.audio_tower.parameters()).device
+
+        planned = self.planned_audio_feature(items, device)
+        if planned is not None:
+            return planned
+        else:
+            pass
+
+        features = [item.feature for item in items]
+        masks = [getattr(item, "feature_attention_mask", None) for item in items]
+
+        # SGLang batches every cache miss in the forward batch into a single
+        # data_embedding_func call (_batch_encode_per_image_misses), so
+        # mixed-length mel features must agree on a frame count. Pad to the
+        # batch max: every frame added here is masked out before the audio
+        # tower runs, so it sees exactly the frames it saw one-at-a-time.
+        frame_lens = [feature.shape[-1] for feature in features]
+        max_frames = max(frame_lens)
+        has_mask = any(mask is not None for mask in masks)
+        if min(frame_lens) != max_frames or has_mask:
+            normalized_masks = []
+            for feature, mask, length in zip(features, masks, frame_lens):
+                if mask is None:
+                    mask = torch.ones(
+                        (feature.shape[0], length),
+                        dtype=torch.long,
+                        device=device,
+                    )
+                elif mask.shape != (feature.shape[0], length):
+                    raise ValueError(
+                        "Qwen3-ASR feature_attention_mask shape "
+                        f"{tuple(mask.shape)} does not match feature batch/frames "
+                        f"{(feature.shape[0], length)}"
+                    )
+                else:
+                    # Item masks can arrive on CPU while features are already
+                    # on the model device; move for the cat below.
+                    mask = mask.to(device=device)
+                normalized_masks.append(
+                    nn.functional.pad(mask, (0, max_frames - length))
+                )
+            masks = normalized_masks
+            has_mask = True
+            if min(frame_lens) != max_frames:
+                features = [
+                    nn.functional.pad(feature, (0, max_frames - feature.shape[-1]))
+                    for feature in features
+                ]
+            else:
+                pass
+        else:
+            pass
+
+        input_features = torch.cat(features).type(self.audio_tower.dtype).to(device)
+
+        if has_mask:
+            feature_attention_mask = torch.cat(masks, dim=0).type(torch.long).to(device)
+            audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
+            input_features = input_features.permute(0, 2, 1)[
+                feature_attention_mask.bool()
+            ].permute(1, 0)
+        else:
+            audio_feature_lengths = torch.tensor(
+                [input_features.shape[-1]] * input_features.shape[0],
+                dtype=torch.long,
+                device=device,
+            )
+            input_features = input_features.permute(0, 2, 1).reshape(
+                -1, input_features.shape[1]
+            )
+
+        runner = self.encoder_graph_runner
+        if runner is not None:
+            token_counts = [
+                (item.model_specific_data or {}).get("num_audio_tokens")
+                for item in items
+            ]
+            if all(count is not None for count in token_counts):
+                window_lens = window_lens_from_token_counts(
+                    token_counts, tokens_per_window=runner.tokens_per_window
+                )
+                graph_plan = runner.plan(sum(window_lens), len(window_lens))
+                if graph_plan is not None and graph_plan[0] not in runner.failed:
+                    hidden = eager_preamble(
+                        self.audio_tower, input_features, audio_feature_lengths
+                    )
+                    graphed = runner.run(hidden, window_lens)
+                    if graphed is not None:
+                        return graphed.unsqueeze(0)
+                    else:
+                        pass
+                else:
+                    pass
+            else:
+                pass
+        else:
+            pass
+
+        audio_outputs = self.audio_tower(
+            input_features,
+            feature_lens=audio_feature_lengths,
+        )
+        return audio_outputs.last_hidden_state
+
+    def planned_audio_feature(
+        self, items: List[MultimodalDataItem], device: torch.device
+    ) -> torch.Tensor | None:
+        """Graph-runner encode whose layout is planned on the host.
+
+        Every mel length is known before the batch reaches the device, so the
+        chunking, valid-frame selection and window plan need no device
+        round trip; returns None to keep the general path for anything else.
+        """
+        runner = self.encoder_graph_runner
+        if runner is None or not items:
+            return None
+        else:
+            pass
+        frame_counts: list[int] = []
+        token_counts: list[int] = []
+        for item in items:
+            feature = item.feature
+            mask = getattr(item, "feature_attention_mask", None)
+            token_count = (item.model_specific_data or {}).get("num_audio_tokens")
+            if (
+                not isinstance(feature, torch.Tensor)
+                or feature.device.type != "cpu"
+                or feature.dim() != 3
+                or feature.shape[0] != 1
+                or feature.shape[1] != 128
+                or not isinstance(mask, torch.Tensor)
+                or mask.device.type != "cpu"
+                or mask.shape != (1, feature.shape[-1])
+                or token_count is None
+            ):
+                return None
+            else:
+                pass
+            frame_count = int(mask.sum())
+            # The general path selects masked frames; only a valid prefix
+            # maps onto the host chunk plan.
+            if frame_count <= 0 or not bool(mask[0, :frame_count].all()):
+                return None
+            else:
+                pass
+            frame_counts.append(frame_count)
+            token_counts.append(int(token_count))
+        tower = self.audio_tower
+        plan = plan_mel_chunks(
+            [item.feature for item in items],
+            frame_counts,
+            chunk_width=tower.n_window * 2,
+            dtype=tower.dtype,
+        )
+        if sum(plan.token_lengths) != sum(token_counts):
+            return None
+        else:
+            pass
+        window_lens = window_lens_from_token_counts(
+            token_counts, tokens_per_window=runner.tokens_per_window
+        )
+        graph_plan = runner.plan(sum(window_lens), len(window_lens))
+        if graph_plan is None or graph_plan[0] in runner.failed:
+            return None
+        else:
+            pass
+        hidden = planned_preamble(tower, plan, device)
+        graphed = runner.run(hidden, window_lens)
+        if graphed is None:
+            return None
+        else:
+            return graphed.unsqueeze(0)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        if forward_batch.mrope_positions is not None:
+            positions = forward_batch.mrope_positions[0]
+        else:
+            pass
+        positions = positions.to(
+            dtype=(torch.int32 if fused_qk_norm_rope is not None else torch.long),
+            device=input_ids.device,
+            non_blocking=True,
+        ).contiguous()
+
+        hidden_states = general_mm_embed_routine(
+            input_ids=input_ids,
+            forward_batch=forward_batch,
+            language_model=self.language_model,
+            data_embedding_funcs={
+                Modality.AUDIO: self.get_audio_feature,
+            },
+            positions=positions,
+        )
+        return hidden_states
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        llm_stacked_params = [
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+        # Audio tower has separate q/k/v in checkpoint → stack into qkv_proj
+        audio_stacked_params = [
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+        ]
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+
+        for name, loaded_weight in weights:
+            if "rotary_emb.inv_freq" in name:
+                continue
+            else:
+                pass
+            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
+                continue
+            else:
+                pass
+
+            if (
+                getattr(
+                    self.config.thinker_config.text_config, "tie_word_embeddings", False
+                )
+                and "lm_head.weight" in name
+            ):
+                continue
+            else:
+                pass
+
+            if "talker" in name or "code2wav" in name:
+                continue
+            else:
+                pass
+
+            if name.startswith("thinker.audio_tower."):
+                name = name.replace("thinker.audio_tower.", "audio_tower.", 1)
+            elif name.startswith("thinker.lm_head."):
+                name = name.replace("thinker.lm_head.", "language_model.lm_head.", 1)
+            elif name.startswith("thinker.model."):
+                name = name.replace("thinker.model.", "language_model.model.", 1)
+            else:
+                pass
+
+            is_audio = "audio_tower" in name
+
+            # Audio tower: remap out_proj → proj for VisionAttention
+            if is_audio and "out_proj" in name:
+                name = name.replace("out_proj", "proj")
+            else:
+                pass
+
+            stacked_params = audio_stacked_params if is_audio else llm_stacked_params
+
+            for param_name, weight_name, shard_id in stacked_params:
+                if weight_name not in name:
+                    continue
+                else:
+                    pass
+                name_tmp = name.replace(weight_name, param_name)
+                if name_tmp.endswith(".bias") and name_tmp not in params_dict:
+                    continue
+                else:
+                    pass
+                if name_tmp not in params_dict:
+                    continue
+                else:
+                    pass
+                param = params_dict[name_tmp]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                else:
+                    pass
+                if name not in params_dict:
+                    continue
+                else:
+                    pass
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+
+
+EntryClass = Qwen3ASRForConditionalGeneration

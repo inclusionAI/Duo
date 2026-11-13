@@ -1,0 +1,21 @@
+{
+  "sglang_omni": {
+    "repository": "https://github.com/sgl-project/sglang-omni"
+  },
+  "sglang": {
+    "repository": "https://github.com/sgl-project/sglang",
+    "commit": "baa9befa381511cd4d56f83980951e5a45fffc6d",
+    "tag": "v0.5.22",
+    "bundled": false
+  },
+  "duo": {
+    "repository": "https://github.com/inclusionAI/Duo",
+    "branch": "inference/sglang-omni-duo",
+    "bundled": true
+  },
+  "browser_codec_source": {
+    "repository": "https://github.com/inclusionAI/Duo",
+    "branch": "inference/vllm-omni-duo",
+    "runtime_dependency": false
+  }
+}

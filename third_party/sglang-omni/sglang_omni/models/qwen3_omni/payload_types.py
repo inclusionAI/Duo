@@ -1,0 +1,204 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Qwen3-Omni payload schemas."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Literal, TypedDict
+
+if TYPE_CHECKING:
+    import torch
+
+    from sglang_omni.models.qwen3_omni.components.image_encoder import (
+        ImageEncoderOutput,
+    )
+else:
+    pass
+
+
+# A talker result whose reply was too short to speak; code2wav ends it without audio.
+NO_SPEECH = "no_speech"
+# The dialog's unit of one user turn; the model route answers it with one whole reply.
+UNIT_FORMAT = "qwen.unit"
+# The session's input audio, 16 kHz PCM16.
+INPUT_BYTES_PER_SECOND = 32000
+
+
+class PromptInputs(TypedDict):
+    """Tokenized prompt inputs for the thinker."""
+
+    input_ids: torch.Tensor
+    attention_mask: torch.Tensor
+    prompt_text: str
+
+
+class ThinkerOutput(TypedDict, total=False):
+    """Normalized thinker output used for decoding and streaming."""
+
+    output_ids: list[int]
+    step: int
+    is_final: bool
+    extra_model_outputs: dict[str, torch.Tensor | list[torch.Tensor] | list[int]]
+    finish_reason: str
+    weight_version: str
+    output_token_logprobs: list[list[float | int]]
+
+
+class StreamState(TypedDict, total=False):
+    token_ids: list[int]
+    text: str
+    emitted_text: str
+
+
+class ThinkerModelInputs(TypedDict, total=False):
+    image_embeds: torch.Tensor
+    video_embeds: torch.Tensor
+    audio_embeds: torch.Tensor
+    image_grid_thw: torch.Tensor
+    video_grid_thw: torch.Tensor
+    feature_attention_mask: torch.Tensor
+    audio_feature_lengths: torch.Tensor
+    video_second_per_grid: torch.Tensor
+    image_deepstack_visual_embeds: list[torch.Tensor]
+    video_deepstack_visual_embeds: list[torch.Tensor]
+    deepstack_visual_embeds: list[torch.Tensor]
+    use_audio_in_video: bool
+
+
+class ThinkerInputs(TypedDict, total=False):
+    model_inputs: ThinkerModelInputs
+    media_cache_keys: dict[str, str]
+
+
+class EncoderOutputs(TypedDict, total=False):
+    image_encoder: ImageEncoderOutput
+    audio_encoder: dict[str, torch.Tensor]
+
+
+class EngineOutputs(EncoderOutputs, total=False):
+    thinker: ThinkerOutput
+
+
+class EncoderInputs(TypedDict, total=False):
+    pixel_values: torch.Tensor | None
+    image_grid_thw: torch.Tensor | None
+    pixel_values_videos: torch.Tensor | None
+    video_grid_thw: torch.Tensor | None
+    video_second_per_grid: torch.Tensor | None
+    use_audio_in_video: bool
+    input_features: torch.Tensor | None
+    feature_attention_mask: torch.Tensor | None
+    audio_feature_lengths: torch.Tensor | None
+    cache_key: str
+    _active: bool
+    _skip: bool
+    _result: ImageEncoderOutput | dict[str, torch.Tensor]
+
+
+@dataclass
+class Qwen3OmniPipelineState:
+    """Typed view of the per-request pipeline state.
+
+    This stays msgpack-safe by converting back to plain dicts before crossing
+    process boundaries.
+    """
+
+    raw_inputs: object | None = None
+    prompt: PromptInputs | None = None
+    mm_inputs: dict[str, dict[str, torch.Tensor | bool | None]] = field(
+        default_factory=dict
+    )
+    encoder_inputs: dict[str, EncoderInputs] = field(default_factory=dict)
+    encoder_outs: EncoderOutputs = field(default_factory=dict)
+    thinker_inputs: dict[str, object] = field(default_factory=dict)
+    thinker_out: ThinkerOutput | None = None
+    engine_outputs: EngineOutputs = field(default_factory=dict)
+    stream_state: StreamState = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: object) -> "Qwen3OmniPipelineState":
+        if not isinstance(data, dict):
+            data = {}
+        else:
+            pass
+        mm_inputs = data.get("mm_inputs")
+        encoder_inputs = data.get("encoder_inputs")
+        encoder_outs = data.get("encoder_outs")
+        thinker_inputs = data.get("thinker_inputs")
+        engine_outputs = data.get("engine_outputs")
+        stream_state = data.get("stream_state")
+        thinker_out = data.get("thinker_out")
+        return cls(
+            raw_inputs=data.get("raw_inputs"),
+            prompt=data.get("prompt"),
+            mm_inputs=mm_inputs if isinstance(mm_inputs, dict) else {},
+            encoder_inputs=encoder_inputs if isinstance(encoder_inputs, dict) else {},
+            encoder_outs=encoder_outs if isinstance(encoder_outs, dict) else {},
+            thinker_inputs=thinker_inputs if isinstance(thinker_inputs, dict) else {},
+            thinker_out=thinker_out if isinstance(thinker_out, dict) else None,
+            engine_outputs=engine_outputs if isinstance(engine_outputs, dict) else {},
+            stream_state=stream_state if isinstance(stream_state, dict) else {},
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        data: dict[str, object] = {}
+        if self.raw_inputs is not None:
+            data["raw_inputs"] = self.raw_inputs
+        else:
+            pass
+        if self.prompt is not None:
+            data["prompt"] = self.prompt
+        else:
+            pass
+        if self.mm_inputs:
+            data["mm_inputs"] = self.mm_inputs
+        else:
+            pass
+        if self.encoder_inputs:
+            data["encoder_inputs"] = self.encoder_inputs
+        else:
+            pass
+        if self.encoder_outs:
+            data["encoder_outs"] = self.encoder_outs
+        else:
+            pass
+        if self.thinker_inputs:
+            data["thinker_inputs"] = self.thinker_inputs
+        else:
+            pass
+        if self.thinker_out is not None:
+            data["thinker_out"] = self.thinker_out
+        else:
+            pass
+        if self.engine_outputs:
+            data["engine_outputs"] = self.engine_outputs
+        else:
+            pass
+        if self.stream_state:
+            data["stream_state"] = self.stream_state
+        else:
+            pass
+        return data
+
+
+Qwen3OmniEventType = Literal[
+    "text_delta",
+    "text_final",
+    "audio_chunk",
+    "audio_final",
+    "image",
+    "video_chunk",
+    "video_final",
+    "debug",
+    "final",
+]
+
+
+@dataclass
+class Qwen3OmniEvent:
+    """Streaming-friendly event emitted by decode logic."""
+
+    type: Qwen3OmniEventType
+    modality: str
+    payload: dict[str, object]
+    is_final: bool = False

@@ -1,0 +1,14 @@
+{
+  "seaside": {
+    "label": "海边女孩",
+    "appearance": "中国女生，深色及肩发，浅杏色衬衫。",
+    "environment": "海边露台。",
+    "initial_pose": "面向镜头。"
+  },
+  "dorm": {
+    "label": "卫衣男孩",
+    "appearance": "中国男生，黑色短发，黑色连帽衫。",
+    "environment": "室内。",
+    "initial_pose": "面向镜头。"
+  }
+}

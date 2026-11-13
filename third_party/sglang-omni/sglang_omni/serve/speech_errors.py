@@ -1,0 +1,138 @@
+# SPDX-License-Identifier: Apache-2.0
+"""OpenAI-compatible error helpers for TTS serving."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from fastapi.responses import JSONResponse
+
+from sglang_omni.admission import QueueFullError
+from sglang_omni.serve.openai_errors import generation_error_status_code
+
+
+@dataclass
+class SpeechAPIError(Exception):
+    """A user-visible TTS API error."""
+
+    message: str
+    status_code: int
+    error_type: str
+    param: str | None = None
+    code: int | str | None = None
+
+    def __post_init__(self) -> None:
+        Exception.__init__(self, self.message)
+
+
+def openai_error_payload(
+    message: str,
+    *,
+    error_type: str,
+    param: str | None = None,
+    code: int | str | None = None,
+) -> dict[str, dict[str, str | int | None]]:
+    """Build an OpenAI-style error envelope."""
+
+    return {
+        "error": {
+            "message": message,
+            "type": error_type,
+            "param": param,
+            "code": code,
+        }
+    }
+
+
+def openai_error_response(
+    message: str,
+    *,
+    status_code: int,
+    error_type: str,
+    param: str | None = None,
+    code: int | str | None = None,
+) -> JSONResponse:
+    """Return an OpenAI-style JSON error response."""
+
+    return JSONResponse(
+        status_code=status_code,
+        content=openai_error_payload(
+            message,
+            error_type=error_type,
+            param=param,
+            code=code,
+        ),
+    )
+
+
+def speech_error_response(error: SpeechAPIError) -> JSONResponse:
+    return openai_error_response(
+        error.message,
+        status_code=error.status_code,
+        error_type=error.error_type,
+        param=error.param,
+        code=error.code,
+    )
+
+
+def speech_websocket_error_payload(error: SpeechAPIError) -> dict[str, str | int]:
+    """Build the public error event used by speech WebSocket transports."""
+    payload: dict[str, str | int] = {
+        "type": "error",
+        "message": error.message,
+        "error_type": error.error_type,
+    }
+    if error.param is not None:
+        payload["param"] = error.param
+    else:
+        pass
+    if error.code is not None:
+        payload["code"] = error.code
+    else:
+        pass
+    return payload
+
+
+def bad_request(message: str, *, param: str | None = None) -> SpeechAPIError:
+    return SpeechAPIError(
+        message=message,
+        status_code=400,
+        error_type="BadRequestError",
+        param=param,
+        code=400,
+    )
+
+
+def internal_error(message: str, *, param: str | None = None) -> SpeechAPIError:
+    return SpeechAPIError(
+        message=message,
+        status_code=500,
+        error_type="server_error",
+        param=param,
+        code=None,
+    )
+
+
+def service_unavailable(message: str, *, param: str | None = None) -> SpeechAPIError:
+    return SpeechAPIError(
+        message=message,
+        status_code=503,
+        error_type="server_error",
+        param=param,
+        code=None,
+    )
+
+
+def speech_generation_error(exc: BaseException) -> SpeechAPIError:
+    """Map pipeline failures to the shared speech API error contract."""
+    if isinstance(exc, SpeechAPIError):
+        return exc
+    else:
+        pass
+    status_code = generation_error_status_code(exc)
+    if status_code == 503:
+        return service_unavailable(QueueFullError.MESSAGE)
+    elif status_code == 400:
+        return bad_request(str(exc))
+    else:
+        return internal_error(str(exc))

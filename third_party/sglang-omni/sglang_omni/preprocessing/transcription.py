@@ -1,0 +1,161 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Shared audio preparation for ASR request builders.
+
+Resolves the audio source from the ``StagePayload``, decodes/resamples it to
+the model's sample rate, then derives the clip duration and cache fingerprint.
+
+Low-level mechanics (decode, load, resample, fingerprint) stay in
+``sglang_omni.utils.audio``.
+
+Model-specific: ``source_name`` used in error messages, duration limit where
+the model has one, and the custom ``source_resolver`` when the model accepts
+sources beyond the default payload keys (e.g. MOSS-Transcribe-Diarize).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Callable
+from urllib.parse import unquote, urlparse
+
+import numpy as np
+from numpy.typing import NDArray
+
+from sglang_omni.preprocessing.resource_connector import get_global_resource_connector
+from sglang_omni.utils.audio import (
+    audio_fingerprint,
+    audio_fingerprint_int,
+    audio_request_timeout,
+    load_audio,
+)
+from sglang_omni.utils.g711 import resolve_g711_encoding, wrap_g711_as_wav
+
+if TYPE_CHECKING:
+    from sglang_omni.proto import StagePayload
+else:
+    pass
+
+DEFAULT_TARGET_SAMPLE_RATE = 16000
+
+# Byte-like sources take precedence over path-like sources; within each group,
+# order is the lookup precedence.
+_BYTES_SOURCE_KEYS = ("audio_bytes", "bytes", "file")
+_PATH_SOURCE_KEYS = ("audio_path", "path", "url")
+
+
+def resolve_audio_source(payload: StagePayload) -> object:
+    """Default source resolver shared by the ASR request builders."""
+    inputs = payload.request.inputs
+    if isinstance(inputs, dict):
+        for key in _BYTES_SOURCE_KEYS:
+            value = inputs.get(key)
+            if value is not None:
+                # If the value is a bytes-like object, check if it's G.711 and wrap it in a WAV container.
+                if isinstance(value, (bytes, bytearray, memoryview)):
+                    g711_encoding = resolve_g711_encoding(
+                        inputs.get("content_type"), inputs.get("filename")
+                    )
+                    if g711_encoding is not None:
+                        return wrap_g711_as_wav(bytes(value), g711_encoding)
+                    else:
+                        pass
+                else:
+                    pass
+                return value
+            else:
+                pass
+        for key in _PATH_SOURCE_KEYS:
+            value = inputs.get(key)
+            if value is not None:
+                return value
+            else:
+                pass
+    else:
+        pass
+    return inputs
+
+
+def police_request_audio(source: object) -> object:
+    """Apply the server's media policy to an audio path or URL from a request.
+
+    Without a policy the source is read as before. With one, a bare path or
+    file URL must sit in the allowed directory, and an http(s) URL is fetched
+    through the connector, which checks the domain on every redirect.
+    """
+    connector = get_global_resource_connector()
+    if (
+        not isinstance(source, str)
+        or source.startswith("data:")
+        or (
+            connector.allowed_local_media_path is None
+            and not connector.allowed_media_domains
+        )
+    ):
+        return source
+    elif source.startswith(("http://", "https://")):
+        data, _ = connector.load_http_bytes(
+            source, timeout=audio_request_timeout(), max_bytes=None
+        )
+        return data
+    elif source.startswith("file://"):
+        return str(connector.local_media_path(unquote(urlparse(source).path)))
+    else:
+        return str(connector.local_media_path(source))
+
+
+@dataclass(frozen=True)
+class PreparedAudio:
+    """Decoded waveform plus the derived per-request audio metadata."""
+
+    waveform: NDArray[np.float32]
+    sample_rate: int
+    duration_s: float
+    fingerprint: str
+
+    @property
+    def fingerprint_int(self) -> int:
+        return audio_fingerprint_int(self.fingerprint)
+
+
+def prepare_audio(
+    payload: StagePayload,
+    *,
+    source_name: str,
+    target_sample_rate: int = DEFAULT_TARGET_SAMPLE_RATE,
+    source_resolver: Callable[[StagePayload], object] = resolve_audio_source,
+    max_duration_s: float | None = None,
+    max_duration_message: str | None = None,
+) -> PreparedAudio:
+    """Resolve, load, and fingerprint the payload's audio for one request."""
+
+    source = police_request_audio(source_resolver(payload))
+    waveform = load_audio(
+        source,
+        source_name=source_name,
+        target_sample_rate=target_sample_rate,
+    )
+    duration_s = float(len(waveform) / target_sample_rate)
+    if max_duration_s is not None and duration_s > max_duration_s:
+        raise ValueError(
+            max_duration_message
+            or (
+                f"{source_name} accepts audio up to {max_duration_s} seconds, "
+                f"got {duration_s:.3f} seconds"
+            )
+        )
+    else:
+        pass
+    return PreparedAudio(
+        waveform=waveform,
+        sample_rate=target_sample_rate,
+        duration_s=duration_s,
+        fingerprint=audio_fingerprint(waveform),
+    )
+
+
+__all__ = [
+    "DEFAULT_TARGET_SAMPLE_RATE",
+    "PreparedAudio",
+    "prepare_audio",
+    "resolve_audio_source",
+]

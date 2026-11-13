@@ -1,0 +1,483 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Public request mapping helpers for Ming-Omni-TTS."""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Mapping
+from typing import SupportsFloat, SupportsIndex, SupportsInt
+
+from typing_extensions import Buffer
+
+from sglang_omni.models.ming_tts.payload_types import (
+    MING_TTS_DEFAULT_MAX_DECODE_STEPS,
+    MingTTSState,
+    store_ming_tts_state,
+)
+from sglang_omni.models.ming_tts.prompt_builder import build_ming_tts_prompt
+from sglang_omni.models.ming_tts.tokenizer import MingTTSTokenizerBundle
+from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.streaming_vocoder import INITIAL_CODEC_CHUNK_FRAMES_PARAM
+
+_REFERENCE_CONTRACT_ERROR = (
+    "Ming-Omni-TTS currently supports only one local reference audio path "
+    "with non-empty reference text"
+)
+_LOGITS_SAMPLING_FIELDS = ("do_sample", "top_p", "top_k", "repetition_penalty")
+_REFERENCE_AUDIO_FIELDS = ("audio_path", "ref_audio", "audio", "prompt_wav_path")
+_DIRECT_REFERENCE_AUDIO_FIELDS = ("audio_path", "ref_audio", "prompt_wav_path")
+_REFERENCE_TEXT_FIELDS = ("ref_text", "prompt_text")
+_UNSUPPORTED_REFERENCE_FIELDS = (
+    "prompt_waveform",
+    "prompt_latents",
+    "prompt_latent",
+    "speaker_embedding",
+    "spk_emb",
+    "use_spk_emb",
+    "use_zero_spk_emb",
+)
+_DURATION_FIELDS = ("token_count", "duration_tokens", "tokens")
+_DEFAULT_TASK_TYPES = {"", "default", "tts", "speech"}
+
+
+def preprocess_ming_tts_payload(
+    payload: StagePayload,
+    *,
+    tokenizer: MingTTSTokenizerBundle,
+    context_length: int,
+    max_decode_steps_cap: int | None = None,
+) -> StagePayload:
+    def optional_text(value: object) -> str | None:
+        if value is None:
+            return None
+        else:
+            pass
+        text_value = str(value).strip()
+        return text_value or None
+
+    def has_non_empty_value(source: Mapping[str, object], field: str) -> bool:
+        if field not in source:
+            return False
+        else:
+            pass
+        value = source[field]
+        if value is None or value is False:
+            return False
+        else:
+            pass
+        if isinstance(value, str):
+            return value.strip() != ""
+        else:
+            pass
+        if isinstance(value, (list, tuple, dict, set)):
+            return bool(value)
+        else:
+            pass
+        return True
+
+    def first_present(
+        *sources: Mapping[str, object], names: tuple[str, ...]
+    ) -> object | None:
+        for source in sources:
+            for name in names:
+                if source.get(name) is not None:
+                    return source[name]
+                else:
+                    pass
+        return None
+
+    def resolve_int(
+        name: str,
+        value: str | Buffer | SupportsInt | SupportsIndex | None,
+        default: int | None = None,
+    ) -> int:
+        if value is None:
+            if default is None:
+                raise ValueError(f"Ming-Omni-TTS {name} must be an integer")
+            else:
+                pass
+            return int(default)
+        else:
+            pass
+        if isinstance(value, bool):
+            raise ValueError(f"Ming-Omni-TTS {name} must be an integer")
+        else:
+            pass
+        if isinstance(value, float) and not value.is_integer():
+            raise ValueError(f"Ming-Omni-TTS {name} must be an integer")
+        else:
+            pass
+        try:
+            return int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Ming-Omni-TTS {name} must be an integer") from exc
+
+    def resolve_float(
+        name: str,
+        value: str | Buffer | SupportsFloat | SupportsIndex | None,
+        default: float,
+    ) -> float:
+        if value is None:
+            return float(default)
+        else:
+            pass
+        if isinstance(value, bool):
+            raise ValueError(f"Ming-Omni-TTS {name} must be a number")
+        else:
+            pass
+        try:
+            result = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Ming-Omni-TTS {name} must be a number") from exc
+        # Note (yzxiao): Range comparisons do not reject NaN, which would
+        # otherwise reach CFM as an invalid latent scale.
+        if not math.isfinite(result):
+            raise ValueError(f"Ming-Omni-TTS {name} must be a finite number")
+        else:
+            pass
+        return result
+
+    params = payload.request.params or {}
+    metadata = payload.request.metadata or {}
+    tts_params = metadata.get("tts_params")
+    if not isinstance(tts_params, dict):
+        tts_params = {}
+    else:
+        pass
+    stage_params = params.get("stage_params")
+    tts_engine_params = {}
+    if isinstance(stage_params, dict) and isinstance(
+        stage_params.get("tts_engine"), dict
+    ):
+        tts_engine_params = stage_params["tts_engine"]
+    else:
+        pass
+
+    inputs = payload.request.inputs or {}
+    if isinstance(inputs, str):
+        text, input_prompt, references = inputs, None, []
+    elif isinstance(inputs, dict):
+        raw_references = inputs.get("references") or []
+        if not isinstance(raw_references, list):
+            raise ValueError("Ming-Omni-TTS references must be a list")
+        else:
+            pass
+        raw_text = inputs.get("text", inputs.get("input", ""))
+        text = str(raw_text) if raw_text is not None else ""
+        input_prompt = optional_text(inputs.get("prompt"))
+        references = [
+            dict(reference)
+            for reference in raw_references
+            if isinstance(reference, dict)
+        ]
+    else:
+        text, input_prompt, references = (
+            str(inputs) if inputs is not None else "",
+            None,
+            [],
+        )
+    text = text.strip()
+    if not text:
+        raise ValueError("Ming-Omni-TTS requires non-empty input text")
+    else:
+        pass
+
+    if len(references) > 1:
+        raise ValueError("Ming-Omni-TTS currently supports only one reference")
+    else:
+        pass
+
+    input_dict = (
+        payload.request.inputs if isinstance(payload.request.inputs, dict) else {}
+    )
+    reference = references[0] if references else {}
+    ref_audio = first_present(
+        reference,
+        names=_REFERENCE_AUDIO_FIELDS,
+    )
+    if ref_audio is None:
+        ref_audio = first_present(
+            input_dict,
+            tts_params,
+            params,
+            names=_DIRECT_REFERENCE_AUDIO_FIELDS,
+        )
+    else:
+        pass
+    if isinstance(ref_audio, str):
+        ref_audio = ref_audio.strip() or None
+    elif ref_audio is not None:
+        raise ValueError(_REFERENCE_CONTRACT_ERROR)
+    else:
+        pass
+    if reference and ref_audio is None:
+        if reference.get("data") is not None:
+            raise ValueError(
+                "Ming-Omni-TTS reference audio must be a local file path; "
+                "inline or URL reference audio is not supported"
+            )
+        else:
+            pass
+        raise ValueError(_REFERENCE_CONTRACT_ERROR)
+    else:
+        pass
+
+    ref_text_value = reference.get("text") if reference else None
+    if ref_text_value is None:
+        ref_text_value = first_present(
+            input_dict,
+            tts_params,
+            params,
+            names=_REFERENCE_TEXT_FIELDS,
+        )
+    else:
+        pass
+    ref_text = optional_text(ref_text_value)
+    if ref_audio is not None and ref_text is None:
+        raise ValueError(_REFERENCE_CONTRACT_ERROR)
+    else:
+        pass
+    if ref_audio is None and ref_text is not None:
+        raise ValueError("Ming-Omni-TTS reference text requires reference audio")
+    else:
+        pass
+
+    if isinstance(payload.request.inputs, dict):
+        for field in _UNSUPPORTED_REFERENCE_FIELDS:
+            if has_non_empty_value(payload.request.inputs, field):
+                raise ValueError(
+                    "Ming-Omni-TTS speaker embedding and prompt latent inputs "
+                    "must be produced by the reference_encode stage"
+                )
+            else:
+                pass
+    else:
+        pass
+
+    for source in (tts_params, params):
+        for field in _UNSUPPORTED_REFERENCE_FIELDS:
+            if has_non_empty_value(source, field):
+                raise ValueError(
+                    "Ming-Omni-TTS speaker embedding and prompt latent inputs "
+                    "must be produced by the reference_encode stage"
+                )
+            else:
+                pass
+        for field in _DURATION_FIELDS:
+            if source.get(field) is not None:
+                raise ValueError(
+                    f"Ming-Omni-TTS field {field!r} is currently unsupported"
+                )
+            else:
+                pass
+
+    voice = tts_params.get("voice", params.get("voice"))
+    if voice is not None and str(voice).strip().lower() not in ("", "default"):
+        raise ValueError(
+            f"Ming-Omni-TTS currently supports only the default voice; got {voice!r}"
+        )
+    else:
+        pass
+
+    language = tts_params.get("language", params.get("language"))
+    if language is not None and str(language).strip().lower() not in ("", "auto"):
+        raise ValueError(
+            "Ming-Omni-TTS language selection is currently unsupported; "
+            f"got {language!r}"
+        )
+    else:
+        pass
+
+    instructions = (
+        tts_params.get("instructions")
+        or tts_params.get("instruct")
+        or params.get("instructions")
+        or params.get("instruct")
+    )
+    if optional_text(instructions):
+        raise ValueError("Ming-Omni-TTS instructions are currently unsupported")
+    else:
+        pass
+
+    task_type = tts_params.get("task_type", params.get("task_type"))
+    if (
+        task_type is not None
+        and str(task_type).strip().lower() not in _DEFAULT_TASK_TYPES
+    ):
+        raise ValueError(
+            "Ming-Omni-TTS currently supports only default text-to-speech; "
+            f"got task_type={task_type!r}"
+        )
+    else:
+        pass
+
+    speed = tts_params.get("speed", params.get("speed"))
+    if speed is not None and float(speed) != 1.0:
+        raise ValueError(
+            f"Ming-Omni-TTS speed control is currently unsupported; got {speed!r}"
+        )
+    else:
+        pass
+
+    initial_codec_chunk_frames = first_present(
+        tts_params,
+        params,
+        names=(INITIAL_CODEC_CHUNK_FRAMES_PARAM,),
+    )
+    if initial_codec_chunk_frames is not None:
+        raise ValueError(
+            "Ming-Omni-TTS does not support initial_codec_chunk_frames because "
+            "initial and steady AudioVAE cadence are configured by "
+            "audio_decode.factory.initial_chunk_patches and "
+            "audio_decode.factory.steady_chunk_patches"
+        )
+    else:
+        pass
+
+    for field in _LOGITS_SAMPLING_FIELDS:
+        if has_non_empty_value(tts_params, field) or has_non_empty_value(
+            tts_engine_params, field
+        ):
+            raise ValueError(
+                f"Ming-Omni-TTS does not use logits sampling field {field!r}"
+            )
+        else:
+            pass
+        if params.get(field) is not None:
+            raise ValueError(
+                f"Ming-Omni-TTS does not use logits sampling field {field!r}"
+            )
+        else:
+            pass
+
+    if (
+        first_present(tts_engine_params, tts_params, params, names=("seed",))
+        is not None
+    ):
+        raise ValueError(
+            "Ming-Omni-TTS seed is currently unsupported because "
+            "FlowLoss sampling is unseeded"
+        )
+    else:
+        pass
+
+    max_steps_value = first_present(
+        tts_engine_params,
+        tts_params,
+        params,
+        names=("max_decode_steps", "ming_max_decode_steps"),
+    )
+    if max_steps_value is None:
+        max_steps_value = params.get("max_new_tokens")
+    else:
+        pass
+    max_decode_steps = resolve_int(
+        "max_decode_steps",
+        max_steps_value,
+        default=MING_TTS_DEFAULT_MAX_DECODE_STEPS,
+    )
+    if max_decode_steps <= 0:
+        raise ValueError(
+            f"Ming-Omni-TTS max_decode_steps must be > 0, got {max_decode_steps}"
+        )
+    else:
+        pass
+    if max_decode_steps_cap is not None and max_decode_steps > int(
+        max_decode_steps_cap
+    ):
+        raise ValueError(
+            "Ming-Omni-TTS max_decode_steps exceeds serving cap: "
+            f"{max_decode_steps} > {int(max_decode_steps_cap)}"
+        )
+    else:
+        pass
+
+    temperature_value = first_present(
+        tts_engine_params,
+        names=("temperature", "ming_temperature"),
+    )
+    if temperature_value is None:
+        temperature_value = first_present(
+            tts_params,
+            names=("temperature", "ming_temperature"),
+        )
+    else:
+        pass
+    if temperature_value is None and params.get("ming_temperature") is not None:
+        temperature_value = params["ming_temperature"]
+    else:
+        pass
+    if temperature_value is None and params.get("temperature") is not None:
+        temperature_value = params["temperature"]
+    else:
+        pass
+
+    prompt = (
+        input_prompt
+        or optional_text(tts_params.get("prompt"))
+        or optional_text(params.get("prompt"))
+    )
+    state = MingTTSState(
+        text=text,
+        prompt=prompt,
+        voice=None,
+        language=None,
+        ref_audio=ref_audio,
+        ref_text=ref_text,
+        max_decode_steps=max_decode_steps,
+        cfg=resolve_float(
+            "cfg",
+            first_present(tts_engine_params, tts_params, params, names=("cfg",)),
+            default=2.0,
+        ),
+        sigma=resolve_float(
+            "sigma",
+            first_present(tts_engine_params, tts_params, params, names=("sigma",)),
+            default=0.25,
+        ),
+        temperature=resolve_float("temperature", temperature_value, default=0.0),
+    )
+    if state.cfg < 1e-5 or state.cfg == 1.0:
+        raise ValueError(
+            "Ming-Omni-TTS currently supports only guided-branch cfg values; "
+            "cfg must be >= 1e-5 and not equal to 1.0"
+        )
+    else:
+        pass
+    if state.sigma < 0:
+        raise ValueError(f"Ming-Omni-TTS sigma must be >= 0, got {state.sigma}")
+    else:
+        pass
+    if state.temperature < 0:
+        raise ValueError(
+            f"Ming-Omni-TTS temperature must be >= 0, got {state.temperature}"
+        )
+    else:
+        pass
+
+    if state.ref_audio is None:
+        plan = build_ming_tts_prompt(state, tokenizer)
+        if plan.prompt_tokens + state.max_decode_steps > int(context_length):
+            raise ValueError(
+                "Ming-Omni-TTS request exceeds context length: "
+                f"prompt_tokens={plan.prompt_tokens}, "
+                f"max_decode_steps={state.max_decode_steps}, "
+                f"context_length={context_length}"
+            )
+        else:
+            pass
+
+        state.prompt = plan.effective_prompt
+        state.input_ids = plan.input_ids
+        state.prompt_tokens = plan.prompt_tokens
+        state.spk_injection_positions = plan.spk_injection_positions
+        state.prompt_latent_start_position = plan.prompt_latent_start_position
+        state.prompt_latent_token_count = plan.prompt_latent_token_count
+    else:
+        pass
+    return store_ming_tts_state(payload, state)
+
+
+__all__ = [
+    "preprocess_ming_tts_payload",
+]

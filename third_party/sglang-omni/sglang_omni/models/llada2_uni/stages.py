@@ -1,0 +1,384 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Stage factories for LLaDA2-Uni pipeline."""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import io
+import logging
+from collections.abc import Mapping
+from contextlib import nullcontext
+
+import torch
+from typing_extensions import NotRequired, TypedDict
+
+from sglang_omni.models.llada2_uni.components.image_decoder import (
+    DecoderBackend,
+    DecoderMode,
+    LLaDA2ImageDecoder,
+)
+from sglang_omni.models.llada2_uni.config import IMAGE_STAGE, THINKER_STAGE
+from sglang_omni.models.llada2_uni.merge import extract_image_vq_tokens
+from sglang_omni.models.llada2_uni.payload_types import (
+    LLaDA2UniEvent,
+    LLaDA2UniPipelineState,
+)
+from sglang_omni.models.weight_loader import resolve_dtype
+from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
+from sglang_omni.utils.device import resolve_concrete_device
+
+logger = logging.getLogger(__name__)
+
+
+class LLaDA2UniEventDict(TypedDict):
+    type: str
+    modality: str
+    payload: dict[str, str | list[str]]
+    is_final: bool
+
+
+LLaDA2UniDecodeResult = TypedDict(
+    "LLaDA2UniDecodeResult",
+    {
+        "events": list[LLaDA2UniEventDict],
+        "text": NotRequired[str | list[str]],
+        "modality": NotRequired[str],
+        "usage": NotRequired[dict[str, int]],
+        "finish_reason": NotRequired[object],
+    },
+)
+
+
+def event_to_dict(event: LLaDA2UniEvent) -> LLaDA2UniEventDict:
+    return {
+        "type": event.type,
+        "modality": event.modality,
+        "payload": dict(event.payload),
+        "is_final": event.is_final,
+    }
+
+
+def create_preprocessing_executor(
+    model_path: str,
+    *,
+    max_seq_len: int | None = None,
+    interleaved: bool = False,
+):
+    from sglang_omni.models.llada2_uni.components.preprocessor import LLaDA2Preprocessor
+
+    preprocessor = LLaDA2Preprocessor(
+        model_path=model_path,
+        max_seq_len=max_seq_len,
+        interleaved=interleaved,
+    )
+    return SimpleScheduler(preprocessor)
+
+
+def create_image_encoder_executor(
+    model_path: str,
+    *,
+    device: str | None = None,
+    gpu_id: int | None = None,
+    dtype: "str | torch.dtype | None" = None,
+):
+    import torch
+
+    from sglang_omni.models.llada2_uni.components.image_encoder import (
+        LLaDA2ImageEncoder,
+    )
+    from sglang_omni.models.llada2_uni.request_builders import (
+        apply_encoder_result,
+        build_encoder_request,
+        merge_image_tokens_for_thinker,
+    )
+
+    dtype = resolve_dtype(dtype)
+    device = str(resolve_concrete_device(device, gpu_id))
+
+    model = LLaDA2ImageEncoder(model_path=model_path, device=device, dtype=dtype)
+
+    def _encode(payload):
+        state = LLaDA2UniPipelineState.from_dict(payload.data)
+        request = build_encoder_request(state, stage_name=IMAGE_STAGE)
+
+        if request.get("_skip"):
+            result = request.get("_result", {})
+        else:
+            with torch.no_grad():
+                result = model(**request)
+
+        apply_encoder_result(state, stage_name=IMAGE_STAGE, result=result)
+        merge_image_tokens_for_thinker(state)
+        state.encoder_inputs.clear()
+        state.encoder_outs.clear()
+        payload.data = state.to_dict()
+        return payload
+
+    return SimpleScheduler(_encode)
+
+
+def create_sglang_dllm_thinker_executor_from_config(
+    model_path: str,
+    *,
+    device: str | None = None,
+    gpu_id: int | None = None,
+    max_seq_len: int = 8192,
+    dllm_algorithm: str = "LowConfidence",
+    dllm_algorithm_config: str | None = None,
+    server_args_overrides: Mapping[str, object] | None = None,
+):
+    """Create an DllmScheduler for the LLaDA2-Uni thinker."""
+    from sglang_omni.models.llada2_uni.bootstrap import create_dllm_thinker_scheduler
+    from sglang_omni.scheduling.sglang_backend import (
+        build_sglang_server_args,
+        pin_resolved_device_type,
+    )
+
+    concrete_device = resolve_concrete_device(device, gpu_id)
+    resolved_gpu_id = concrete_device.index or 0
+
+    overrides: dict[str, object] = {
+        "attention_backend": "flashinfer",
+        "disable_cuda_graph": True,
+        "sampling_backend": "pytorch",
+    }
+    if dllm_algorithm == "LowConfidenceCFG":
+        from sglang_omni.models.llada2_uni.bootstrap import register_llada2_uni_cfg
+        from sglang_omni.models.llada2_uni.cfg_attention_backend import (
+            CFG_ATTENTION_BACKEND,
+        )
+
+        register_llada2_uni_cfg()
+        overrides["attention_backend"] = CFG_ATTENTION_BACKEND
+        overrides["dllm_fdfo"] = False
+    else:
+        pass
+    overrides.update(server_args_overrides or {})
+    pin_resolved_device_type(overrides, concrete_device.type)
+
+    server_args = build_sglang_server_args(
+        model_path,
+        context_length=max_seq_len,
+        dllm_algorithm=dllm_algorithm,
+        dllm_algorithm_config=dllm_algorithm_config,
+        **overrides,
+    )
+    from sglang.srt.arg_groups.model_override_base import resolved_view
+
+    cfg = resolved_view(server_args)
+    logger.info(
+        "create_sglang_dllm_thinker_executor_from_config: "
+        "dllm_algorithm=%s, mem_fraction_static=%s",
+        cfg.dllm_algorithm,
+        cfg.mem_fraction_static,
+    )
+    return create_dllm_thinker_scheduler(server_args, resolved_gpu_id)
+
+
+def create_decode_executor(model_path: str):
+    from sglang_omni.models.llada2_uni.components.common import load_llada2_tokenizer
+    from sglang_omni.models.llada2_uni.merge import decode_events
+
+    tokenizer = load_llada2_tokenizer(model_path)
+
+    def _decode(payload):
+        state = LLaDA2UniPipelineState.from_dict(payload.data)
+        thinker_out = state.thinker_out or state.engine_outputs.get(THINKER_STAGE)
+        if not isinstance(thinker_out, dict):
+            logger.warning(
+                "request %s: thinker produced no output (got %s), returning empty text",
+                payload.request_id,
+                type(thinker_out).__name__,
+            )
+            thinker_out = {
+                "output_ids": [],
+                "is_final": True,
+            }
+        else:
+            pass
+
+        if state.thinking_phase == "image":
+            events = [
+                LLaDA2UniEvent(
+                    type="text_final",
+                    modality="text",
+                    payload={"text": state.thinking_text},
+                    is_final=True,
+                )
+            ]
+        else:
+            events = decode_events(
+                thinker_out=thinker_out,
+                tokenizer=tokenizer,
+            )
+        event_dicts = [event_to_dict(event) for event in events]
+
+        result: LLaDA2UniDecodeResult = {"events": event_dicts}
+        if events:
+            result.update(events[0].payload)
+            result.setdefault("modality", events[0].modality)
+        else:
+            pass
+
+        finish_reason = thinker_out.get("finish_reason")
+        if finish_reason is not None:
+            result.setdefault("finish_reason", finish_reason)
+        else:
+            pass
+
+        input_ids = (
+            state.prompt.get("input_ids") if isinstance(state.prompt, dict) else None
+        )
+        if state.thinking_phase == "image":
+            prompt_tokens = state.thinking_prompt_tokens
+        elif input_ids is None:
+            prompt_tokens = 0
+        elif hasattr(input_ids, "numel"):
+            prompt_tokens = int(input_ids.numel())
+        else:
+            prompt_tokens = len(input_ids)
+
+        completion_ids = thinker_out.get("output_ids") or []
+        completion_tokens = len(completion_ids) + state.thinking_completion_tokens
+
+        result.setdefault(
+            "usage",
+            {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            },
+        )
+
+        payload.data = result
+        return payload
+
+    return SimpleScheduler(_decode)
+
+
+def create_image_decode_executor(
+    model_path: str,
+    *,
+    device: str | None = None,
+    gpu_id: int | None = None,
+    dtype: str | torch.dtype | None = None,
+    decode_mode: DecoderMode = "normal",
+    num_steps: int = 50,
+    resolution_multiplier: int = 2,
+    backend: DecoderBackend = "diffusers",
+    attention_backend: str = "torch_sdpa",
+) -> SimpleScheduler[StagePayload, StagePayload]:
+    concrete_device = resolve_concrete_device(device, gpu_id)
+    dtype = resolve_dtype(dtype)
+    runtime = None
+    if backend == "sglang":
+        from sglang_omni.models.llada2_uni.components.decoder_runtime import (
+            initialize_decoder_runtime,
+        )
+
+        runtime = initialize_decoder_runtime(
+            model_path,
+            gpu_id=concrete_device.index if concrete_device.type == "cuda" else None,
+            dtype=dtype,
+            attention_backend=attention_backend,
+        )
+    else:
+        pass
+    try:
+        with runtime.compute_context() if runtime else nullcontext():
+            decoder = LLaDA2ImageDecoder(
+                model_path=model_path,
+                device=str(concrete_device),
+                dtype=dtype,
+                decode_mode=decode_mode,
+                num_steps=num_steps,
+                resolution_multiplier=resolution_multiplier,
+                backend=backend,
+                runtime=runtime,
+            )
+    except BaseException:
+        if runtime:
+            runtime.close()
+        else:
+            pass
+        raise
+
+    def decode_image(payload: StagePayload) -> StagePayload:
+        state = LLaDA2UniPipelineState.from_dict(payload.data)
+        result = extract_image_vq_tokens(state)
+        if result is None:
+            if state.task_kind in ("t2i", "edit"):
+                raise ValueError(
+                    f"{state.task_kind} request did not produce image VQ tokens"
+                )
+            else:
+                pass
+            payload.data = {"events": [], "modality": "image", "skipped": True}
+            return payload
+        else:
+            pass
+
+        vq_tokens, grid_height, grid_width, generation_params = result
+        call_kwargs = {
+            target: generation_params[source]
+            for source, target in (
+                ("decode_mode", "decode_mode"),
+                ("decoder_steps", "num_steps"),
+                ("seed", "seed"),
+            )
+            if generation_params.get(source) is not None
+        }
+        if (
+            call_kwargs.get("decode_mode") == "decoder-turbo"
+            and "num_steps" not in call_kwargs
+        ):
+            call_kwargs["num_steps"] = 8
+        else:
+            pass
+        with runtime.compute_context() if runtime else nullcontext():
+            image = decoder.decode(vq_tokens, grid_height, grid_width, **call_kwargs)
+        image_buffer = io.BytesIO()
+        image.save(image_buffer, format="PNG")
+        image_b64 = base64.b64encode(image_buffer.getvalue()).decode("ascii")
+        if state.task_kind == "interleaved":
+            # One inline image segment for the UMM controller.
+            png = image_buffer.getvalue()
+            payload.data = {
+                "kind": "image",
+                "mime_type": "image/png",
+                "size_bytes": len(png),
+                "sha256": hashlib.sha256(png).hexdigest(),
+                "url": f"data:image/png;base64,{image_b64}",
+            }
+            return payload
+        else:
+            pass
+        event = LLaDA2UniEvent(
+            type="image_final",
+            modality="image",
+            payload={"image": image_b64, "format": "png"},
+            is_final=True,
+        )
+        payload.data = {
+            "events": [event_to_dict(event)],
+            "modality": "image",
+            **event.payload,
+        }
+        return payload
+
+    if runtime is None:
+        return SimpleScheduler(decode_image)
+    else:
+        pass
+
+    class ImageDecoderScheduler(SimpleScheduler[StagePayload, StagePayload]):
+        def start(self) -> None:
+            try:
+                super().start()
+            finally:
+                # Shutdown callbacks run before the compute thread has exited.
+                runtime.close()
+
+    return ImageDecoderScheduler(decode_image)

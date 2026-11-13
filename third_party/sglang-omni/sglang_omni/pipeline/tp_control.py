@@ -1,0 +1,217 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Internal TP control helpers.
+
+These helpers sit above the per-rank SGLang worker layer and below the
+pipeline stage abstraction. They mirror stage-control messages and, for
+non-SGLang schedulers (e.g. SimpleScheduler-based image encoders),
+replicate work payloads from the leader to follower ranks so that NCCL
+collectives in TP-parallel forward passes do not deadlock.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import queue as queue_mod
+from dataclasses import dataclass
+from multiprocessing.queues import Queue
+
+from sglang_omni.proto.messages import (
+    AbortMessage,
+    AdminMessage,
+    AdminResultMessage,
+    FreezeGCMessage,
+    ProfilerStartMessage,
+    ProfilerStopMessage,
+    ShutdownMessage,
+)
+from sglang_omni.proto.request import StagePayload
+
+logger = logging.getLogger(__name__)
+
+_WORK_POLL_SECONDS = 0.1
+
+TPControlMessage = (
+    ShutdownMessage
+    | FreezeGCMessage
+    | ProfilerStartMessage
+    | ProfilerStopMessage
+    | AdminMessage
+)
+
+
+@dataclass
+class TPWorkMessage:
+    """Payload replicated from the TP leader to follower schedulers."""
+
+    request_id: str
+    data: StagePayload
+
+
+TPWorkQueueMessage = TPControlMessage | TPWorkMessage
+
+
+class TPLeaderFanout:
+    """Broadcast leader-owned stage events to TP followers."""
+
+    def __init__(
+        self,
+        stage_name: str,
+        *,
+        follower_work_queues: list[Queue[TPWorkQueueMessage]],
+        follower_abort_queues: list[Queue[AbortMessage]],
+        follower_admin_result_queues: list[Queue[AdminResultMessage]] | None = None,
+    ) -> None:
+        self.stage_name = stage_name
+        self.follower_work_queues = list(follower_work_queues)
+        self.follower_abort_queues = list(follower_abort_queues)
+        self.follower_admin_result_queues = list(follower_admin_result_queues or [])
+
+    async def fanout_control(
+        self,
+        msg: TPControlMessage,
+    ) -> None:
+        for q in self.follower_work_queues:
+            q.put_nowait(msg)
+
+    def fanout_work(self, payload: StagePayload) -> None:
+        msg = TPWorkMessage(request_id=getattr(payload, "request_id", ""), data=payload)
+        for q in self.follower_work_queues:
+            q.put_nowait(msg)
+
+    async def fanout_abort(self, msg: AbortMessage) -> None:
+        for q in self.follower_abort_queues:
+            q.put_nowait(msg)
+
+    async def collect_admin_results(
+        self,
+        op_id: str,
+        *,
+        timeout_s: float = 60.0,
+    ) -> list[AdminResultMessage]:
+        """Collect one admin result from every TP follower."""
+        if not self.follower_admin_result_queues:
+            return []
+        else:
+            pass
+
+        loop = asyncio.get_running_loop()
+        tasks = [
+            loop.run_in_executor(
+                None,
+                lambda q=q: q.get(timeout=timeout_s),
+            )
+            for q in self.follower_admin_result_queues
+        ]
+        raw_results = await asyncio.gather(*tasks)
+        results: list[AdminResultMessage] = []
+        for msg in raw_results:
+            if not isinstance(msg, AdminResultMessage):
+                raise ValueError(
+                    f"Unexpected TP follower admin result: {type(msg).__name__}"
+                )
+            else:
+                pass
+            if msg.result.op_id != op_id:
+                raise ValueError(
+                    "Unexpected TP follower admin op id: "
+                    f"{msg.result.op_id} != {op_id}"
+                )
+            else:
+                pass
+            results.append(msg)
+        return results
+
+    def close(self) -> None:
+        self.follower_work_queues.clear()
+        self.follower_abort_queues.clear()
+        self.follower_admin_result_queues.clear()
+
+
+class TPFollowerControlPlane:
+    """Follower-side control plane backed by multiprocessing queues."""
+
+    def __init__(
+        self,
+        *,
+        stage_name: str,
+        recv_endpoint: str = "",
+        work_queue: Queue[TPWorkQueueMessage],
+        abort_queue: Queue[AbortMessage],
+        admin_result_queue: Queue[AdminResultMessage] | None = None,
+    ) -> None:
+        self.stage_name = stage_name
+        self.recv_endpoint = recv_endpoint
+        self.work_queue = work_queue
+        self.abort_queue = abort_queue
+        self.admin_result_queue = admin_result_queue
+        self.closed = False
+
+    async def start(self) -> None:
+        logger.info("TP follower control plane started for stage %s", self.stage_name)
+
+    async def recv(
+        self,
+    ) -> (
+        AdminMessage
+        | ShutdownMessage
+        | FreezeGCMessage
+        | ProfilerStartMessage
+        | ProfilerStopMessage
+        | TPWorkMessage
+    ):
+        msg = await self.recv_from_queue(self.work_queue)
+        if isinstance(
+            msg,
+            (
+                AdminMessage,
+                ShutdownMessage,
+                FreezeGCMessage,
+                ProfilerStartMessage,
+                ProfilerStopMessage,
+                TPWorkMessage,
+            ),
+        ):
+            return msg
+        else:
+            pass
+        raise ValueError(f"Unexpected TP follower work message: {type(msg)}")
+
+    async def recv_abort(self) -> AbortMessage:
+        msg = await self.recv_from_queue(self.abort_queue)
+        if isinstance(msg, AbortMessage):
+            return msg
+        else:
+            pass
+        raise ValueError(f"Unexpected TP follower abort message: {type(msg)}")
+
+    async def send_admin_result(self, msg: AdminResultMessage) -> None:
+        if self.admin_result_queue is None:
+            raise RuntimeError(
+                f"TP follower stage {self.stage_name} has no admin result queue"
+            )
+        else:
+            pass
+        self.admin_result_queue.put_nowait(msg)
+
+    async def recv_from_queue(
+        self, q: Queue[TPWorkQueueMessage] | Queue[AbortMessage]
+    ) -> TPWorkQueueMessage | AbortMessage:
+        loop = asyncio.get_running_loop()
+        while True:
+            if self.closed:
+                raise RuntimeError(
+                    f"TP follower control plane closed for stage {self.stage_name}"
+                )
+            else:
+                pass
+            try:
+                return await loop.run_in_executor(
+                    None,
+                    lambda: q.get(timeout=_WORK_POLL_SECONDS),
+                )
+            except queue_mod.Empty:
+                continue
+
+    def close(self) -> None:
+        self.closed = True

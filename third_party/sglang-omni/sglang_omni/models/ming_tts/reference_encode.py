@@ -1,0 +1,276 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Reference audio encoding for Ming-Omni-TTS reference-conditioned TTS."""
+
+from __future__ import annotations
+
+import onnxruntime
+import torch
+import torchaudio
+import torchaudio.functional as F
+from numpy.typing import ArrayLike
+
+from sglang_omni.models.ming_tts.payload_types import (
+    MING_TTS_SAMPLE_RATE,
+    load_ming_tts_state,
+    store_ming_tts_state,
+)
+from sglang_omni.models.ming_tts.prompt_builder import build_ming_tts_prompt
+from sglang_omni.models.ming_tts.tokenizer import MingTTSTokenizerBundle
+from sglang_omni.modules.ming_audio.vae.modeling_audio_vae import AudioVAE
+from sglang_omni.preprocessing.cache_key import reference_path_cache_key
+from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.reference_encoder import (
+    KeyedReferenceEncodeHook,
+    ReferenceEncodeService,
+)
+from sglang_omni.utils.audio_features import cached_fbank
+
+
+class MingSpeakerEmbeddingExtractor:
+    """CampPlus speaker embedding extractor matching the official reference path."""
+
+    def __init__(self, campplus_model: str, *, target_sr: int = 16000) -> None:
+        session_options = onnxruntime.SessionOptions()
+        session_options.graph_optimization_level = (
+            onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+        )
+        session_options.intra_op_num_threads = 2
+        self.session = onnxruntime.InferenceSession(
+            campplus_model,
+            sess_options=session_options,
+            providers=["CPUExecutionProvider"],
+        )
+        self.target_sr = int(target_sr)
+
+    def __call__(self, waveform: ArrayLike | torch.Tensor) -> torch.Tensor:
+        if not isinstance(waveform, torch.Tensor):
+            waveform = torch.as_tensor(waveform)
+        else:
+            pass
+        feat = cached_fbank(
+            waveform,
+            num_mel_bins=80,
+            sample_frequency=self.target_sr,
+        )
+        feat = feat - feat.mean(dim=0, keepdim=True)
+        input_name = self.session.get_inputs()[0].name
+        embedding = self.session.run(None, {input_name: feat.unsqueeze(0).numpy()})[0]
+        return torch.as_tensor(embedding.reshape(1, -1), dtype=torch.float32)
+
+
+class MingTTSReferenceEncodeHook(KeyedReferenceEncodeHook[str, dict, dict]):
+    """Cache text-independent reference conditioning by audio content."""
+
+    model_revision = ""
+    encoder_id = "ming_audio_vae_campplus"
+    artifact_kind = "ref_conditioning"
+
+    def __init__(self, encoder: "MingTTSReferenceEncoder", *, model_identity: str):
+        self.encoder = encoder
+        self.model_id = str(model_identity)
+        self.encoder_config_hash = (
+            f"sr{encoder.sample_rate}:patch{encoder.patch_size}:dtype{encoder.dtype}"
+        )
+
+    def normalize_input(self, raw_input: object) -> str:
+        return str(raw_input)
+
+    def input_key(self, item: str) -> str | None:
+        # Note (yzxiao): Full-content hashing avoids same-size middle-content
+        # collisions; unreadable paths bypass the cache to preserve the source error.
+        return reference_path_cache_key(item, trust_stat=False)
+
+    def encode_one(self, item: str) -> dict:
+        return self.encoder.encode_reference(item)
+
+    def store_artifact(self, artifact: dict) -> dict:
+        return dict(artifact)
+
+    def load_artifact(self, stored: dict) -> dict:
+        return dict(stored)
+
+
+class MingTTSReferenceEncoder:
+    """Encode a single reference audio into speaker embedding and prompt latent."""
+
+    def __init__(
+        self,
+        audio_vae: AudioVAE,
+        speaker_encoder: MingSpeakerEmbeddingExtractor,
+        *,
+        patch_size: int,
+        cache_model_identity: str | None = None,
+        cache_max_items: int | None = 256,
+        cache_max_bytes: int | None = 64 * 1024 * 1024,
+    ) -> None:
+        self.audio_vae = audio_vae
+        self.sample_rate = int(audio_vae.config.sample_rate)
+        first_parameter = next(audio_vae.parameters())
+        self.device = first_parameter.device
+        self.dtype = first_parameter.dtype
+        self.patch_size = int(patch_size)
+        self.speaker_encoder = speaker_encoder
+        if self.sample_rate != MING_TTS_SAMPLE_RATE:
+            raise ValueError(
+                "Ming-Omni-TTS reference encoder requires sample_rate "
+                f"{MING_TTS_SAMPLE_RATE}, got {self.sample_rate}"
+            )
+        else:
+            pass
+        if self.patch_size <= 0:
+            raise ValueError(
+                f"Ming-Omni-TTS reference encoder patch_size must be > 0, got {patch_size}"
+            )
+        else:
+            pass
+        self.service: ReferenceEncodeService[str, dict, dict] | None = None
+        if cache_model_identity is not None:
+            self.service = ReferenceEncodeService(
+                MingTTSReferenceEncodeHook(self, model_identity=cache_model_identity),
+                max_items=cache_max_items,
+                max_bytes=cache_max_bytes,
+                log_prefix="Ming-Omni-TTS ref cache",
+            )
+        else:
+            pass
+
+    def encode_reference(self, ref_audio: str) -> dict:
+        """Text-independent conditioning bundle for one reference audio."""
+
+        prompt_waveform, speaker_waveform = self.load_reference_waveform(ref_audio)
+        prompt_waveform = self.pad_waveform(prompt_waveform)
+
+        with torch.inference_mode():
+            waveform_length = torch.tensor(
+                [int(prompt_waveform.shape[1])],
+                dtype=torch.long,
+                device=self.device,
+            )
+            prompt_waveform = self.prepare_audio_vae_waveform(prompt_waveform)
+            prompt_latent, _prompt_latent_length = self.audio_vae.encode_latent(
+                prompt_waveform,
+                waveform_length,
+            )
+        frames = int(prompt_latent.shape[1])
+        speaker_embedding = self.speaker_encoder(speaker_waveform)
+
+        # Note (luojiaxuan): Keep artifacts on CPU float32 so the shared cache
+        # never pins device memory and typed_tensor emits float32 unchanged.
+        speaker = speaker_embedding.detach().to(device="cpu", dtype=torch.float32)
+        prompt_latent = prompt_latent.detach().to(device="cpu", dtype=torch.float32)
+        return {
+            "spk_emb": speaker,
+            "prompt_latent": prompt_latent,
+            "prompt_latent_token_count": frames // self.patch_size,
+        }
+
+    def encode_payload(
+        self,
+        payload: StagePayload,
+        *,
+        tokenizer: MingTTSTokenizerBundle,
+        context_length: int,
+    ) -> StagePayload:
+        state = load_ming_tts_state(payload)
+        if state.ref_audio is None:
+            return payload
+        else:
+            pass
+
+        ref_audio = str(state.ref_audio)
+        if self.service is not None:
+            artifact = self.service.get_or_encode(ref_audio, desc=repr(ref_audio))
+        else:
+            artifact = self.encode_reference(ref_audio)
+
+        state.spk_emb = artifact["spk_emb"]
+        state.prompt_latent = artifact["prompt_latent"]
+        state.prompt_latent_token_count = int(artifact["prompt_latent_token_count"])
+
+        plan = build_ming_tts_prompt(
+            state,
+            tokenizer,
+            prompt_text=state.ref_text,
+            speaker_count=1,
+            prompt_latent_token_count=state.prompt_latent_token_count,
+        )
+        if plan.prompt_tokens + state.max_decode_steps > int(context_length):
+            raise ValueError(
+                "Ming-Omni-TTS request exceeds context length after reference encode: "
+                f"prompt_tokens={plan.prompt_tokens}, "
+                f"max_decode_steps={state.max_decode_steps}, "
+                f"context_length={context_length}"
+            )
+        else:
+            pass
+
+        state.prompt = plan.effective_prompt
+        state.input_ids = plan.input_ids
+        state.prompt_tokens = plan.prompt_tokens
+        state.spk_injection_positions = plan.spk_injection_positions
+        state.prompt_latent_start_position = plan.prompt_latent_start_position
+        state.prompt_latent_token_count = plan.prompt_latent_token_count
+
+        return store_ming_tts_state(payload, state)
+
+    def load_reference_waveform(self, path: str) -> tuple[torch.Tensor, torch.Tensor]:
+        waveform, sample_rate = torchaudio.load(path)
+        if waveform.ndim != 2 or int(waveform.shape[0]) != 1:
+            raise ValueError(
+                "Ming-Omni-TTS currently supports only mono reference audio, "
+                f"got shape {tuple(waveform.shape)}"
+            )
+        else:
+            pass
+        speaker_waveform = waveform
+        if int(sample_rate) != self.sample_rate:
+            waveform = F.resample(
+                waveform,
+                orig_freq=int(sample_rate),
+                new_freq=self.sample_rate,
+            )
+        else:
+            pass
+        if int(sample_rate) != self.speaker_encoder.target_sr:
+            speaker_waveform = F.resample(
+                speaker_waveform,
+                orig_freq=int(sample_rate),
+                new_freq=self.speaker_encoder.target_sr,
+            )
+        else:
+            pass
+        return waveform, speaker_waveform
+
+    def pad_waveform(self, waveform: torch.Tensor) -> torch.Tensor:
+        pad_align = int(1 / 12.5 * self.patch_size * self.sample_rate)
+        new_len = (int(waveform.shape[-1]) + pad_align - 1) // pad_align * pad_align
+        if new_len == int(waveform.shape[-1]):
+            return waveform
+        else:
+            pass
+        padded = torch.zeros(
+            1,
+            new_len,
+            dtype=waveform.dtype,
+            device=waveform.device,
+        )
+        padded[:, : int(waveform.shape[-1])] = waveform
+        return padded
+
+    def prepare_audio_vae_waveform(self, waveform: torch.Tensor) -> torch.Tensor:
+        if not isinstance(waveform, torch.Tensor):
+            waveform = torch.as_tensor(waveform)
+        else:
+            pass
+        # Note (yzxiao): The official monolithic path reaches AudioVAE encode
+        # under bf16 autocast, so this split stage must match weight dtype.
+        return waveform.to(
+            device=self.device,
+            dtype=self.dtype,
+        )
+
+
+__all__ = [
+    "MingSpeakerEmbeddingExtractor",
+    "MingTTSReferenceEncoder",
+]
