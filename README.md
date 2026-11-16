@@ -7,6 +7,7 @@
 [![Homepage](https://img.shields.io/badge/-Homepage-0A66C2?logo=googlechrome&logoColor=white&labelColor=555)](https://duo-v1.github.io/)
 [![arXiv](https://img.shields.io/badge/arXiv-2611.15131-B31B1B?logo=arxiv&logoColor=white&labelColor=555)](https://arxiv.org/abs/2611.15131)
 [![Hugging Face](https://img.shields.io/badge/-Hugging%20Face-FFD21E?logo=huggingface&logoColor=white&labelColor=555)](https://huggingface.co/collections/inclusionAI/duo-v1)
+[![ModelScope](https://img.shields.io/badge/-ModelScope-624AFF?logo=modelscope&logoColor=white&labelColor=555)](https://www.modelscope.cn/collections/inclusionAI/Duo-v1)
 [![GitHub](https://img.shields.io/badge/-GitHub-181717?logo=github&logoColor=white&labelColor=555)](https://github.com/inclusionAI/Duo)
 [![Technical Report](https://img.shields.io/badge/-TechReport-526A78?logo=readthedocs&logoColor=white&labelColor=555)](https://github.com/inclusionAI/Duo/blob/main/assets/Duo_Technical_Report.pdf)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue?logo=apache&logoColor=white&labelColor=555)](https://www.apache.org/licenses/LICENSE-2.0)
