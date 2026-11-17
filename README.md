@@ -117,7 +117,7 @@ hf download inclusionAI/Duo-1.0-distill --local-dir weights
 # Or: hf download inclusionAI/Duo-1.0-distill-quant --local-dir weights
 ```
 
-To store the bundle elsewhere, change `--local-dir` and update the model paths in `configs/inference.json`. The complete directory layout is:
+To store the bundle elsewhere, change `--local-dir` and update the model paths in `configs/inference.json`. A DCP-based bundle has this directory layout:
 
 ```text
 weights/
@@ -137,6 +137,8 @@ weights/
     ├── recognizer/
     └── forced-aligner/
 ```
+
+**Updating an existing DCP download.** If the offline runtime reports `Realization checkpoint file is missing: dcp/.metadata`, download the updated `realization/dcp/.metadata` and `realization/complete.json` from the same model on Hugging Face or ModelScope. Copy both files into their original paths in your local bundle, keeping the existing `*.distcp` shards. The leading dot makes `.metadata` hidden in some file browsers. This update applies to Duo-1.2-causal-base, Duo-1.0-causal-base, and Duo-1.0-distill. [See issue #1](https://github.com/inclusionAI/Duo/issues/1).
 
 The runtime reads every weight locally and does not download models at startup. Keep `realization_family` set to `auto`; the manifest selects `student` for causal checkpoints and `realization` for distilled checkpoints. Release manifests also select the validated sampler defaults: 50 Euler steps with flow shift 1.0 for causal-base, and 4 Euler steps with flow shift 5.0 for distilled models. The quantized release is dequantized by the portable offline runtime; optimized FP8 execution is provided by the dedicated serving branches.
 
