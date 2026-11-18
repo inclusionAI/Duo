@@ -35,13 +35,17 @@ requirements and adapting another release, see
 
 ## Installation
 
+For a clean-environment recipe, the complete artifact checklist, bundled
+presets and startup/readiness checks, see [Deployment](docs/deployment.md).
+The reference serving dependency versions are in `requirements-serving.txt`.
+
 Create an environment with a compatible NVIDIA driver, CUDA, PyTorch, vLLM,
 and FlashAttention stack. Then install the vLLM-Omni source included in this
 branch:
 
 ```bash
 VLLM_OMNI_VERSION_OVERRIDE=0.0.0.dev0 \
-  pip install -e third_party/vllm-omni
+  pip install -e third_party/vllm-omni -r requirements-serving.txt
 ```
 
 Install the browser gateway dependencies in a separate environment:
@@ -59,13 +63,17 @@ The deployment helper prepares the engine configuration, model paths, browser
 gateway, and launch scripts for a new runtime directory. Follow the
 [Duo online serving guide](third_party/vllm-omni/apps/duo/README.md) to:
 
-1. encode a reference image;
+1. select a bundled reference preset, or encode your own reference image;
 2. prepare a runtime with the matching Intent and Realization checkpoints;
 3. start the engine with `serve.sh`;
 4. start the browser gateway with `run-web.sh`.
 
 The example serves live camera/microphone calls and uploaded-video inference.
 Browser camera access requires HTTPS or localhost.
+
+The two demo presets, including images and reference tensors, are included in
+`third_party/vllm-omni/apps/duo/assets/personas`. Pass that directory with
+`--personas-dir` as shown in the deployment guide.
 
 ## Configuration and Validation
 

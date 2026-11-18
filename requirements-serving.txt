@@ -1,0 +1,5 @@
+# Core versions used by the serving integration. Install the bundled source too.
+vllm==0.33.0
+transformers==5.19.0
+-r third_party/vllm-omni/apps/duo/requirements-engine.txt
+-r third_party/vllm-omni/apps/duo/requirements-web.txt

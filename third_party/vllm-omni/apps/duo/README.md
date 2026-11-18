@@ -46,6 +46,15 @@ Model and adapter access and weight licenses are determined by their providers.
 Model adapters, protocol metadata, and FP8 profiles are supplied with the
 corresponding model release.
 
+## Included Demo Personas
+
+`apps/duo/assets/personas` includes the 海边女孩 and 卫衣男孩 descriptions,
+576 x 768 reference images and matching reference tensors. Use
+`--personas-dir /path/to/apps/duo/assets/personas` together with the selected
+preset's `portrait.jpg` and `reference.pt` as `--reference-image` and
+`--reference-latent`. See the [preset notes](assets/personas/README.md).
+Custom images and changed codecs still require reference encoding.
+
 ## Prepare a Reference Latent
 
 Place a portrait named `portrait.jpg` in an operator-owned directory, sized for

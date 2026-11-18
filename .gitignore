@@ -8,3 +8,6 @@
 *.ckpt
 __pycache__/
 *.pyc
+# Small bundled reference tensors, not model checkpoints.
+!third_party/vllm-omni/apps/duo/assets/personas/portraits/seaside/reference.pt
+!third_party/vllm-omni/apps/duo/assets/personas/portraits/dorm/reference.pt
