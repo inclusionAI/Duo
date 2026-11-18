@@ -85,7 +85,7 @@ class StreamingIntent:
 
     def prompt(self, messages, generation=False):
         return self.tokenizer.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=generation
+            messages, tokenize=True, add_generation_prompt=generation, return_dict=False
         )
 
     def system_prefix(self):
